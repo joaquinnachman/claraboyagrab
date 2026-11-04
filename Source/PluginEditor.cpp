@@ -437,11 +437,11 @@ public:
 
     void paint (juce::Graphics& g) override
     {
-        const auto& items = owner.getSearchResult().items;
-        if (! juce::isPositiveAndBelow (row, (int) items.size()))
+        const auto& found = owner.getSearchResult().items;
+        if (! juce::isPositiveAndBelow (row, (int) found.size()))
             return;
 
-        const auto& c = items[(size_t) row];
+        const auto& c = found[(size_t) row];
         const auto& f = owner.getFonts();
         const bool hot = hover || owner.getHighlighted() == row;
 

@@ -88,6 +88,13 @@ static const char* ytmFixture = R"JSON({"contents":{"tabbedSearchResultsRenderer
      {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Canción"},{"text":" • "},{"text":"Banda Tributo"},{"text":" • "},{"text":"Covers 2020"},{"text":" • "},{"text":"4:54"}]}}}],
    "playlistItemData":{"videoId":"COVERvid001"}}},
  {"musicResponsiveListItemRenderer":{
+   "flexColumns":[
+     {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Like A Stone (Originally Performed By Audioslave) (Karaoke Version)"}]}}},
+     {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[
+        {"text":"Hit Tunes Karaoke","navigationEndpoint":{"browseEndpoint":{"browseEndpointContextSupportedConfigs":{"browseEndpointContextMusicConfig":{"pageType":"MUSIC_PAGE_TYPE_ARTIST"}}}}},
+        {"text":" • "},{"text":"Karaoke Vol. 227"},{"text":" • "},{"text":"4:54"}]}}}],
+   "playlistItemData":{"videoId":"KARAOKEvid1"}}},
+ {"musicResponsiveListItemRenderer":{
    "flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Audioslave"}]}}}]}},
  {"musicResponsiveListItemRenderer":{
    "flexColumns":[
@@ -141,16 +148,16 @@ static void offlineTests()
     std::cout << "\n== Buscador: lectura de resultados de YouTube Music\n";
     {
         auto items = parseYTMusicResponse (juce::JSON::parse (juce::String::fromUTF8 (ytmFixture)), SearchKind::songs);
-        check (items.size() == 3, "3 resultados (saltea el artista y el repetido)", juce::String ((int) items.size()));
+        check (items.size() == 4, "4 resultados (saltea el artista y el repetido)", juce::String ((int) items.size()));
 
-        if (items.size() == 3)
+        if (items.size() == 4)
         {
             eq (items[0].title, "Like a Stone (Live)", "1: título");
             eq (items[0].artist, "Audioslave", "1: artista");
             eq (items[0].extra, "Live in Cuba", "1: disco");
             check (items[0].duration == 331.0, "1: duración 5:31", juce::String (items[0].duration));
             eq (items[0].thumbUrl, "https://lh3.googleusercontent.com/a=w120-h120-l90-rj", "1: tapa de 120 px (nítida en pantallas 2x)");
-            eq (items[0].url(), "https://music.youtube.com/watch?v=LIVEvid0001", "1: link para bajar");
+            eq (items[0].url(), "https://www.youtube.com/watch?v=LIVEvid0001", "1: link para bajar");
             eq (items[1].videoId, "STUDIOvid01", "2: id desde el botón de play");
             eq (items[1].thumbUrl, "https://lh3.googleusercontent.com/b=w60-h60", "2: tapa con // arreglada");
             eq (items[2].artist, "Banda Tributo", "3: artista sin enlaces (saca «Canción»)");
@@ -163,9 +170,11 @@ static void offlineTests()
             rankCandidates (items, q);
             eq (items[0].videoId, "STUDIOvid01", "orden: primero la versión de estudio (misma duración)");
             check (items[0].durationMatch, "marca MISMA DURACIÓN en la de estudio");
-            check (! items[1].durationMatch && ! items[2].durationMatch, "no marca el vivo ni el cover (aunque el cover dure igual)");
+            check (! items[1].durationMatch && ! items[2].durationMatch && ! items[3].durationMatch,
+                   "no marca el vivo, el cover ni el karaoke (aunque duren igual o nombren a la banda)");
             eq (items[1].videoId, "COVERvid001", "orden: después el cover que dura igual");
-            eq (items[2].videoId, "LIVEvid0001", "orden: el vivo queda último");
+            eq (items[2].videoId, "LIVEvid0001", "orden: después el vivo");
+            eq (items[3].videoId, "KARAOKEvid1", "orden: el karaoke queda último");
         }
 
         TrackQuery none;

@@ -248,7 +248,8 @@ namespace
 //==============================================================================
 juce::String Candidate::url() const
 {
-    return (isVideo ? "https://www.youtube.com/watch?v=" : "https://music.youtube.com/watch?v=") + videoId;
+    // Mismo id en YouTube y YouTube Music: se baja por el link común de YouTube (el camino más probado de yt-dlp).
+    return "https://www.youtube.com/watch?v=" + videoId;
 }
 
 double parseDurationText (const juce::String& raw)
@@ -370,7 +371,10 @@ void rankCandidates (std::vector<Candidate>& items, const TrackQuery& expected)
         const auto cA = tokens (c.artist);
 
         const float titleSim  = 0.7f * overlap (eT, cT) + 0.3f * overlap (cT, eT);
-        const float artistSim = eA.isEmpty() ? 0.5f : juce::jmax (overlap (eA, cA), overlap (eA, cT));
+        // En videos el artista suele estar en el título ("Banda - Tema"); en canciones solo vale el artista.
+        const float artistSim = eA.isEmpty() ? 0.5f
+                              : c.isVideo   ? juce::jmax (overlap (eA, cA), overlap (eA, cT))
+                                            : overlap (eA, cA);
 
         float durSim = 0.0f;
         double delta = -1.0;
@@ -395,7 +399,8 @@ void rankCandidates (std::vector<Candidate>& items, const TrackQuery& expected)
 
         c.score = 3.0f * titleSim + 2.0f * artistSim + 1.5f * durSim - versionPenalty - 0.04f * (float) i;
         // La marca va solo si además es el mismo tema del mismo artista (no un cover que dura igual).
-        c.durationMatch = delta >= 0.0 && delta <= 2.5 && titleSim >= 0.5f && (eA.isEmpty() || artistSim >= 0.5f);
+        c.durationMatch = delta >= 0.0 && delta <= 2.5 && titleSim >= 0.5f && versionPenalty == 0.0f
+                       && (eA.isEmpty() || artistSim >= 0.5f);
     }
 
     std::stable_sort (items.begin(), items.end(), [] (const Candidate& a, const Candidate& b) { return a.score > b.score; });

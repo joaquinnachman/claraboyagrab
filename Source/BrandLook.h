@@ -73,6 +73,23 @@ public:
 
         auto r = b.getLocalBounds().toFloat().reduced (0.5f);
 
+        if ((bool) b.getProperties()["tab"])
+        {
+            if (b.getToggleState())
+            {
+                g.setColour (brand::bordo.brighter (over ? 0.2f : 0.0f));
+                g.fillRoundedRectangle (r, 4.0f);
+            }
+            else
+            {
+                g.setColour (over ? brand::rowHi : brand::row);
+                g.fillRoundedRectangle (r, 4.0f);
+                g.setColour (brand::line);
+                g.drawRoundedRectangle (r, 4.0f, 1.0f);
+            }
+            return;
+        }
+
         if ((bool) b.getProperties()["primary"])
         {
             auto c = down ? brand::bordo.darker (0.25f) : (over ? brand::red : brand::bordo);
@@ -92,6 +109,7 @@ public:
     {
         if ((bool) b.getProperties()["primary"]) return fonts->title ((float) h * 0.56f, 0.06f);
         if ((bool) b.getProperties()["flat"])    return fonts->semi (12.5f);
+        if ((bool) b.getProperties()["tab"])     return fonts->bold (10.5f, 0.08f);
         return fonts->bold (11.0f, 0.08f);
     }
 

@@ -2,6 +2,8 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "GrabEngine.h"
+#include "Search.h"
+#include "ThumbCache.h"
 
 /** No procesa audio: lo deja pasar tal cual. Es solo la "casa" del bajador dentro de Cubase. */
 class GrabProcessor final : public juce::AudioProcessor
@@ -35,6 +37,8 @@ public:
     void setStateInformation (const void*, int) override {}
 
     grab::Engine engine;
+    grab::Searcher searcher;
+    ThumbCache thumbs;
 
 private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GrabProcessor)

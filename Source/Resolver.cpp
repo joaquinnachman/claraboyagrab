@@ -411,6 +411,94 @@ TrackQuery parseStreamingPage (const juce::String& platform, const std::string& 
     return q;
 }
 
+juce::String spotifyTrackId (const juce::String& text)
+{
+    // .../track/<22 caracteres base62>  (también sirve dentro de un HTML)
+    for (int from = 0;;)
+    {
+        auto idx = text.indexOfIgnoreCase (from, "/track/");
+        if (idx < 0)
+            return {};
+
+        auto id = text.substring (idx + 7, idx + 7 + 22);
+        if (id.length() == 22 && id.containsOnly ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+            return id;
+
+        from = idx + 7;
+    }
+}
+
+namespace
+{
+    juce::var findTrackObject (const juce::var& v, int depth)
+    {
+        if (depth > 30)
+            return {};
+
+        if (auto* obj = v.getDynamicObject())
+        {
+            const auto artists = obj->getProperty ("artists");
+            const bool named = obj->hasProperty ("name") || obj->hasProperty ("title");
+
+            if (named && artists.isArray() && artists.size() > 0)
+                return v;
+
+            for (auto& p : obj->getProperties())
+                if (auto found = findTrackObject (p.value, depth + 1); ! found.isVoid())
+                    return found;
+        }
+        else if (auto* arr = v.getArray())
+        {
+            for (auto& e : *arr)
+                if (auto found = findTrackObject (e, depth + 1); ! found.isVoid())
+                    return found;
+        }
+
+        return {};
+    }
+}
+
+TrackQuery parseSpotifyEmbed (const std::string& html)
+{
+    TrackQuery q;
+
+    auto start = html.find ("id=\"__NEXT_DATA__\"");
+    if (start == std::string::npos)
+        return q;
+
+    start = html.find ('>', start);
+    const auto end = start == std::string::npos ? std::string::npos : html.find ("</script>", start);
+    if (end == std::string::npos)
+        return q;
+
+    const auto json = juce::JSON::parse (juce::String::fromUTF8 (html.data() + start + 1, (int) (end - start - 1)));
+
+    // Lugar habitual: props.pageProps.state.data.entity; si cambia, se busca cualquier objeto con "artists".
+    auto entity = json.getProperty ("props", {}).getProperty ("pageProps", {})
+                      .getProperty ("state", {}).getProperty ("data", {}).getProperty ("entity", {});
+
+    if (! entity.isObject() || ! entity.getProperty ("artists", {}).isArray())
+        entity = findTrackObject (json, 0);
+
+    if (! entity.isObject())
+        return q;
+
+    q.title = entity.getProperty ("name", entity.getProperty ("title", {})).toString().trim();
+
+    if (auto* artists = entity.getProperty ("artists", {}).getArray(); artists != nullptr && ! artists->isEmpty())
+        q.artist = artists->getReference (0).getProperty ("name", {}).toString().trim();
+
+    if (q.artist.isEmpty())
+        q.artist = entity.getProperty ("subtitle", {}).toString().upToFirstOccurrenceOf (",", false, false).trim();
+
+    auto dur = (double) entity.getProperty ("duration", entity.getProperty ("duration_ms", 0));
+    if (auto* dobj = entity.getProperty ("duration", {}).getDynamicObject())
+        dur = (double) dobj->getProperty ("totalMilliseconds");
+
+    q.durationSec = dur > 10000.0 ? dur / 1000.0 : dur;
+    return q;
+}
+
 juce::String appleTrackId (const juce::String& url)
 {
     auto i = queryParam (url, "i");
@@ -460,6 +548,20 @@ TrackQuery resolveStreaming (const juce::String& url, const juce::String& platfo
             { q.error = TR ("Los podcasts de Spotify no se pueden bajar."); return q; }
         if (looksLikeCollection)
             { q.error = TR ("Pegá el link de un tema, no de un disco, playlist o artista."); return q; }
+
+        auto id = spotifyTrackId (url);
+
+        if (id.isEmpty())   // link corto (spotify.link / spoti.fi): la página final trae el link largo
+            id = spotifyTrackId (fetchText (url));
+
+        if (id.isNotEmpty())
+        {
+            // La página "embed" trae los datos del tema ordenados (título, artistas, duración).
+            auto embed = parseSpotifyEmbed (fetchText ("https://open.spotify.com/embed/track/" + id).toStdString());
+
+            if (embed.title.isNotEmpty() && embed.artist.isNotEmpty())
+                return embed;
+        }
     }
 
     if (platform == "Apple Music")

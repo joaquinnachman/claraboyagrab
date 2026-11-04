@@ -44,6 +44,8 @@ namespace grab
     juce::String cleanTitle (juce::String s);
     TrackQuery parseStreamingPage (const juce::String& platform, const std::string& html);
     juce::String appleTrackId (const juce::String& url);
+    juce::String spotifyTrackId (const juce::String& text);
+    TrackQuery parseSpotifyEmbed (const std::string& html);
     juce::String deezerTrackId (const juce::String& text);
 
     /** "Artista - Tema" prolijo para el nombre del WAV. */

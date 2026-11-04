@@ -4,6 +4,29 @@
 
 using grab::TR;
 
+namespace
+{
+    void drawPill (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour bg, juce::Colour fg,
+                   const juce::Font& font, const juce::String& text)
+    {
+        g.setColour (bg);
+        g.fillRoundedRectangle (r, r.getHeight() * 0.5f);
+        g.setColour (fg);
+        g.setFont (font);
+        g.drawText (text, r, juce::Justification::centred, false);
+    }
+
+    juce::String whenText (juce::int64 ms)
+    {
+        if (ms <= 0)
+            return {};
+
+        const juce::Time t (ms), now = juce::Time::getCurrentTime();
+        const bool today = t.getYear() == now.getYear() && t.getDayOfYear() == now.getDayOfYear();
+        return today ? "hoy " + t.formatted ("%H:%M") : t.formatted ("%d/%m %H:%M");
+    }
+}
+
 //==============================================================================
 /** Una fila de la lista: descarga en curso, error, o WAV listo para arrastrar. */
 class GrabEditor::Row final : public juce::Component
@@ -28,10 +51,9 @@ public:
         g.setColour (hover && it->draggable() ? brand::rowHi : brand::row);
         g.fillRoundedRectangle (rf, 5.0f);
 
-        const auto stripe = it->kind == K::active  ? brand::red
-                          : it->kind == K::failed  ? brand::yellow.withAlpha (0.8f)
-                          : it->kind == K::doneJob ? brand::white
-                                                   : brand::line;
+        const auto stripe = it->kind == K::active ? brand::red
+                          : it->kind == K::failed ? brand::yellow.withAlpha (0.8f)
+                                                  : brand::line;
         g.setColour (stripe);
         g.fillRoundedRectangle (rf.withWidth (4.0f), 2.0f);
 
@@ -43,11 +65,9 @@ public:
         g.setFont (f.bold (14.5f));
         g.drawFittedText (it->title, content.removeFromTop (21), juce::Justification::centredLeft, 1, 0.9f);
 
-        const bool warn = it->kind == K::failed || it->warning.isNotEmpty();
-        g.setColour (warn ? brand::yellow : brand::grey);
+        g.setColour (it->kind == K::failed ? brand::yellow : brand::grey);
         g.setFont (f.semi (12.0f));
-        g.drawFittedText (it->warning.isNotEmpty() ? it->warning : it->sub,
-                          content.removeFromTop (17), juce::Justification::centredLeft, 1, 0.85f);
+        g.drawFittedText (it->sub, content.removeFromTop (17), juce::Justification::centredLeft, 1, 0.85f);
 
         if (it->kind == K::active)
         {
@@ -62,7 +82,6 @@ public:
             }
             else
             {
-                // Sin porcentaje: un bloque que va y viene.
                 const auto t = (float) (juce::Time::getMillisecondCounter() % 1400) / 1400.0f;
                 const auto w = bar.getWidth() * 0.25f;
                 const auto x = bar.getX() + (bar.getWidth() - w) * (0.5f - 0.5f * std::cos (t * juce::MathConstants<float>::twoPi));
@@ -70,7 +89,6 @@ public:
             }
         }
 
-        // Zona derecha
         if (it->draggable())
         {
             auto grip = right.removeFromLeft (14).toFloat();
@@ -211,11 +229,336 @@ private:
 };
 
 //==============================================================================
+/** Panel de opciones del buscador: elegís cuál bajar. */
+class GrabEditor::ResultsPanel final : public juce::Component,
+                                       private juce::ListBoxModel
+{
+public:
+    std::function<void()> onClose, onSkip;
+    std::function<void (grab::SearchKind)> onKind;
+
+    explicit ResultsPanel (GrabEditor& o) : owner (o)
+    {
+        for (auto* b : { &songsTab, &videosTab })
+        {
+            b->setClickingTogglesState (false);
+            b->getProperties().set ("tab", true);
+            addAndMakeVisible (*b);
+        }
+
+        songsTab.setButtonText ("CANCIONES");
+        videosTab.setButtonText ("VIDEOS");
+        songsTab.onClick  = [this] { if (onKind) onKind (grab::SearchKind::songs); };
+        videosTab.onClick = [this] { if (onKind) onKind (grab::SearchKind::videos); };
+
+        closeButton.setButtonText ("CERRAR");
+        closeButton.onClick = [this] { if (onClose) onClose(); };
+        addAndMakeVisible (closeButton);
+
+        skipButton.setButtonText ("SALTEAR");
+        skipButton.onClick = [this] { if (onSkip) onSkip(); };
+        addChildComponent (skipButton);
+
+        list.setModel (this);
+        list.setRowHeight (64);
+        list.getViewport()->setScrollBarThickness (8);
+        list.setWantsKeyboardFocus (false);
+        addAndMakeVisible (list);
+    }
+
+    ~ResultsPanel() override { list.setModel (nullptr); }
+
+    void setQueueInfo (int index, int total)
+    {
+        queueIndex = index;
+        queueTotal = total;
+        skipButton.setVisible (total > 1 && index < total);
+        resized();
+        repaint();
+    }
+
+    void refresh()
+    {
+        const auto& r = owner.getSearchResult();
+        const bool videos = r.request.kind == grab::SearchKind::videos;
+        songsTab.setToggleState (! videos, juce::dontSendNotification);
+        videosTab.setToggleState (videos, juce::dontSendNotification);
+        list.updateContent();
+        list.repaint();
+        repaint();
+    }
+
+    void repaintRows()                        { list.repaint(); }
+    void scrollToRow (int row)                { if (row >= 0) list.scrollToEnsureRowIsOnscreen (row); }
+
+    void paint (juce::Graphics& g) override
+    {
+        using State = grab::Searcher::Result::State;
+        const auto& f = owner.getFonts();
+        const auto& r = owner.getSearchResult();
+
+        g.setColour (brand::bgDeep.withAlpha (0.55f));
+        g.fillRoundedRectangle (getLocalBounds().toFloat(), 8.0f);
+        g.setColour (brand::line);
+        g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (0.5f), 8.0f, 1.0f);
+
+        // Título
+        auto t = titleArea;
+        const juce::String prefix;
+
+        if (queueTotal > 1)
+        {
+            g.setColour (brand::grey);
+            g.setFont (f.bold (10.5f, 0.12f));
+            g.drawText ("TEMA " + juce::String (queueIndex) + " DE " + juce::String (queueTotal), queueArea,
+                        juce::Justification::centredRight, false);
+        }
+
+        if (r.state == State::resolving)
+        {
+            g.setColour (brand::white);
+            g.setFont (f.title (21.0f, 0.05f));
+            g.drawFittedText (prefix + TR ("LEYENDO EL TEMA EN ") + r.request.platform.toUpperCase() + TR ("…"),
+                              t, juce::Justification::centredLeft, 1, 0.8f);
+        }
+        else if (r.hasSource())
+        {
+            const auto platform = (r.request.platform.isNotEmpty() ? r.request.platform : juce::String ("LINK")).toUpperCase();
+            const auto lead = prefix + platform;
+            const auto leadFont = f.title (21.0f, 0.05f);
+            const auto leadW = juce::GlyphArrangement::getStringWidth (leadFont, lead) + 10.0f;
+
+            g.setColour (brand::red.brighter (0.25f));
+            g.setFont (leadFont);
+            g.drawText (lead, t.removeFromLeft ((int) leadW), juce::Justification::centredLeft, false);
+
+            g.setColour (brand::white);
+            g.setFont (f.bold (14.0f));
+            auto line = r.source.displayName();
+            if (r.source.durationSec > 0)
+                line << TR (" · ") << grab::formatDuration (r.source.durationSec);
+            g.drawFittedText (line, t, juce::Justification::centredLeft, 1, 0.85f);
+        }
+        else
+        {
+            g.setColour (brand::white);
+            g.setFont (f.title (21.0f, 0.05f));
+            g.drawFittedText (prefix + TR ("RESULTADOS PARA «") + r.query.toUpperCase() + TR ("»"),
+                              t, juce::Justification::centredLeft, 1, 0.75f);
+        }
+
+        // Línea de ayuda
+        juce::String help;
+        bool warn = false;
+
+        switch (r.state)
+        {
+            case State::resolving: help = TR ("Leyendo título, artista y duración del link…"); break;
+            case State::searching: help = TR ("Buscando en YouTube Music…"); break;
+            case State::failed:    help = r.error; warn = true; break;
+            case State::done:
+                if (r.items.empty())       { help = TR ("No encontré nada. Probá con otras palabras o en VIDEOS."); warn = true; }
+                else if (r.usedFallback)   { help = TR ("YouTube Music no respondió: son resultados de YouTube. Elegí cuál bajar."); warn = true; }
+                else if (r.hasSource())    help = TR ("Elegí cuál bajar. «MISMA DURACIÓN» = dura igual que el original.");
+                else                       help = TR ("Elegí cuál bajar: clic en la opción (o flechas y Enter).");
+                break;
+            case State::idle:
+            default: break;
+        }
+
+        g.setColour (warn ? brand::yellow : brand::grey);
+        g.setFont (f.semi (12.0f));
+        g.drawFittedText (help, helpArea, juce::Justification::centredLeft, 1, 0.85f);
+
+        // Animación mientras busca
+        if (r.state == State::resolving || r.state == State::searching)
+        {
+            auto bar = list.getBounds().removeFromTop (3).toFloat();
+            g.setColour (brand::line);
+            g.fillRect (bar);
+            const auto ph = (float) (juce::Time::getMillisecondCounter() % 1200) / 1200.0f;
+            const auto w = bar.getWidth() * 0.3f;
+            g.setColour (brand::red);
+            g.fillRect (bar.withX (bar.getX() + (bar.getWidth() + w) * ph - w).withWidth (w).getIntersection (bar));
+        }
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (14, 10);
+
+        // 1) De dónde viene / qué se buscó  ·  CERRAR
+        auto top = r.removeFromTop (30);
+        closeButton.setBounds (top.removeFromRight (78).reduced (0, 2));
+        top.removeFromRight (10);
+        titleArea = top;
+
+        // 2) CANCIONES | VIDEOS  ·  TEMA 1 DE 3  SALTEAR
+        r.removeFromTop (6);
+        auto tabs = r.removeFromTop (28);
+        songsTab.setBounds (tabs.removeFromLeft (98));
+        tabs.removeFromLeft (6);
+        videosTab.setBounds (tabs.removeFromLeft (74));
+
+        if (skipButton.isVisible())
+        {
+            skipButton.setBounds (tabs.removeFromRight (84));
+            tabs.removeFromRight (10);
+        }
+        queueArea = tabs;
+
+        // 3) Ayuda
+        r.removeFromTop (6);
+        helpArea = r.removeFromTop (20);
+        r.removeFromTop (6);
+        list.setBounds (r);
+    }
+
+private:
+    class ResultRow;
+
+    int getNumRows() override { return (int) owner.getSearchResult().items.size(); }
+    void paintListBoxItem (int, juce::Graphics&, int, int, bool) override {}
+    juce::Component* refreshComponentForRow (int row, bool, juce::Component* existing) override;
+
+    GrabEditor& owner;
+    juce::TextButton songsTab, videosTab, closeButton, skipButton;
+    juce::ListBox list;
+    juce::Rectangle<int> titleArea, helpArea, queueArea;
+    int queueIndex = 0, queueTotal = 0;
+};
+
+class GrabEditor::ResultsPanel::ResultRow final : public juce::Component
+{
+public:
+    explicit ResultRow (GrabEditor& o) : owner (o) {}
+
+    void setRow (int r) { row = r; repaint(); }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto& items = owner.getSearchResult().items;
+        if (! juce::isPositiveAndBelow (row, (int) items.size()))
+            return;
+
+        const auto& c = items[(size_t) row];
+        const auto& f = owner.getFonts();
+        const bool hot = hover || owner.getHighlighted() == row;
+
+        auto r = getLocalBounds().reduced (0, 3);
+        g.setColour (hot ? brand::rowHi : brand::row);
+        g.fillRoundedRectangle (r.toFloat(), 5.0f);
+
+        if (owner.getHighlighted() == row)
+        {
+            g.setColour (brand::red);
+            g.drawRoundedRectangle (r.toFloat().reduced (0.5f), 5.0f, 1.2f);
+        }
+
+        auto content = r.reduced (8, 6);
+
+        // Tapa
+        auto thumb = content.removeFromLeft (46).withSizeKeepingCentre (46, 46).toFloat();
+        content.removeFromLeft (12);
+        {
+            juce::Graphics::ScopedSaveState ss (g);
+            juce::Path clip;
+            clip.addRoundedRectangle (thumb, 4.0f);
+            g.reduceClipRegion (clip);
+
+            if (auto img = owner.getThumb (c.thumbUrl); img.isValid())
+            {
+                g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
+                g.drawImage (img, thumb, juce::RectanglePlacement::centred | juce::RectanglePlacement::fillDestination);
+            }
+            else
+            {
+                g.setColour (brand::bgDeep);
+                g.fillRect (thumb);
+                g.setColour (brand::line);
+                g.fillRect (thumb.reduced (15.0f, 13.0f).withWidth (5.0f).translated (2.0f, 0.0f));
+                g.fillEllipse (thumb.getCentreX() - 9.0f, thumb.getCentreY() + 2.0f, 9.0f, 7.0f);
+            }
+        }
+
+        // Derecha: duración + BAJAR
+        auto right = content.removeFromRight (hot ? 132 : 56);
+        content.removeFromRight (8);
+
+        if (hot)
+        {
+            auto pill = right.removeFromRight (70).withSizeKeepingCentre (70, 28).toFloat();
+            drawPill (g, pill, brand::bordo.brighter (hover ? 0.25f : 0.1f), brand::white, f.title (17.0f, 0.06f), "BAJAR");
+            right.removeFromRight (6);
+        }
+
+        g.setColour (c.durationMatch ? brand::white : brand::grey);
+        g.setFont (f.bold (12.5f));
+        g.drawText (grab::formatDuration (c.duration), right, juce::Justification::centredRight, false);
+
+        // Texto
+        g.setColour (brand::white);
+        g.setFont (f.bold (14.0f));
+        g.drawFittedText (c.title, content.removeFromTop (content.getHeight() / 2).withTrimmedBottom (1),
+                          juce::Justification::bottomLeft, 1, 0.85f);
+
+        auto line2 = content.withTrimmedTop (2);
+
+        if (c.durationMatch)
+        {
+            const auto font = f.bold (9.5f, 0.06f);
+            const auto label = TR ("MISMA DURACIÓN");
+            const auto w = juce::GlyphArrangement::getStringWidth (font, label) + 14.0f;
+            drawPill (g, line2.removeFromLeft ((int) w).withHeight (16).toFloat(), brand::yellow, brand::bg, font, label);
+            line2.removeFromLeft (8);
+        }
+
+        juce::String sub = c.artist;
+        if (c.extra.isNotEmpty())
+            sub << (sub.isNotEmpty() ? TR (" · ") : juce::String()) << c.extra;
+
+        g.setColour (brand::grey);
+        g.setFont (f.semi (12.0f));
+        g.drawFittedText (sub, line2.withHeight (16), juce::Justification::centredLeft, 1, 0.85f);
+    }
+
+    void mouseEnter (const juce::MouseEvent&) override { hover = true; repaint(); }
+    void mouseExit  (const juce::MouseEvent&) override { hover = false; repaint(); }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (e.mouseWasClicked() && ! e.mods.isPopupMenu())
+            owner.pick (row);
+    }
+
+private:
+    GrabEditor& owner;
+    int row = -1;
+    bool hover = false;
+};
+
+juce::Component* GrabEditor::ResultsPanel::refreshComponentForRow (int row, bool, juce::Component* existing)
+{
+    auto* r = dynamic_cast<ResultRow*> (existing);
+
+    if (r == nullptr)
+    {
+        delete existing;
+        r = new ResultRow (owner);
+        r->setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    }
+
+    r->setRow (row);
+    return r;
+}
+
+//==============================================================================
 GrabEditor::GrabEditor (GrabProcessor& p)
-    : AudioProcessorEditor (p), processorRef (p), engine (p.engine)
+    : AudioProcessorEditor (p), processorRef (p), engine (p.engine), searcher (p.searcher)
 {
     setLookAndFeel (&look);
     formats.registerBasicFormats();
+    logo = juce::ImageCache::getFromMemory (BinaryData::logocabecera_png, BinaryData::logocabecera_pngSize);
 
     input.setFont (fonts->semi (15.0f));
     input.setTextToShowWhenEmpty (TR ("Pegá un link o escribí artista y tema"), brand::grey);
@@ -224,14 +567,23 @@ GrabEditor::GrabEditor (GrabProcessor& p)
     input.setMultiLine (false);
     input.setReturnKeyStartsNewLine (false);
     input.setSelectAllWhenFocused (true);
-    input.onReturnKey  = [this] { startFromUI(); };
-    input.onTextChange = [this] { goButton.setButtonText (input.isEmpty() ? TR ("PEGAR Y BAJAR") : TR ("BAJAR")); };
+    input.onReturnKey  = [this]
+    {
+        const auto& r = searchResult;
+        if (resultsVisible() && highlighted >= 0 && r.state == grab::Searcher::Result::State::done)
+            pick (highlighted);
+        else
+            startFromUI();
+    };
+    input.onEscapeKey  = [this] { if (resultsVisible()) closeResults(); };
+    input.onTextChange = [this] { handleTyping(); };
+    input.addKeyListener (this);
     addAndMakeVisible (input);
 
-    goButton.setButtonText (TR ("PEGAR Y BAJAR"));
     goButton.getProperties().set ("primary", true);
     goButton.onClick = [this] { startFromUI(); };
     addAndMakeVisible (goButton);
+    updateGoButton();
 
     folderButton.getProperties().set ("flat", true);
     folderButton.onClick = [this]
@@ -246,8 +598,23 @@ GrabEditor::GrabEditor (GrabProcessor& p)
     settingsButton.onClick = [this] { showSettings(); };
     addAndMakeVisible (settingsButton);
 
+    clearButton.setButtonText ("LIMPIAR LISTA");
+    clearButton.setTooltip (TR ("Saca todo de la lista. Los WAV siguen en la carpeta."));
+    clearButton.onClick = [this]
+    {
+        engine.clearList();
+        toast (TR ("Lista limpia. Los archivos siguen en la carpeta."));
+    };
+    addAndMakeVisible (clearButton);
+
     banner = std::make_unique<ToolsBanner> (*this);
     addChildComponent (*banner);
+
+    results = std::make_unique<ResultsPanel> (*this);
+    results->onClose = [this] { closeResults(); };
+    results->onSkip  = [this] { advanceAfterPick(); };
+    results->onKind  = [this] (grab::SearchKind k) { setSearchKind (k); };
+    addChildComponent (*results);
 
     list.setModel (this);
     list.setRowHeight (60);
@@ -255,19 +622,25 @@ GrabEditor::GrabEditor (GrabProcessor& p)
     addAndMakeVisible (list);
 
     setResizable (true, true);
-    setResizeLimits (460, 420, 1100, 1100);
-    setSize (580, 540);
+    setResizeLimits (480, 460, 1200, 1200);
+    setSize (600, 600);
+
+    searcher.clear();
+    searchResult = searcher.getResult();
+    lastSearchRevision = searcher.getRevision();
 
     updateBanner();
-    rescanFolder();
+    updateFolderLabel();
     rebuildItems();
-    startTimerHz (12);
+    startTimerHz (15);
 }
 
 GrabEditor::~GrabEditor()
 {
     stopTimer();
+    input.removeKeyListener (this);
     list.setModel (nullptr);
+    results.reset();
     setLookAndFeel (nullptr);
 }
 
@@ -276,15 +649,24 @@ void GrabEditor::paint (juce::Graphics& g)
 {
     g.fillAll (brand::bg);
 
-    // Título: CLARABOYA + GRAB sobre bordó (como "AL MASTER" en los reels)
+    // Cabecera: logo (claraboya + diskette) · CLARABOYA · GRAB sobre bordó
     {
+        auto x = (float) headerArea.getX();
+        const auto y = (float) headerArea.getY() + 14.0f;
+
+        if (logo.isValid())
+        {
+            const float h = 46.0f;
+            const float w = h * (float) logo.getWidth() / (float) logo.getHeight();
+            g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
+            g.drawImage (logo, juce::Rectangle<float> (x, y - 3.0f, w, h), juce::RectanglePlacement::centred);
+            x += w + 14.0f;
+        }
+
         const auto font = fonts->title (40.0f, 0.06f);
         const juce::String a ("CLARABOYA"), b ("GRAB");
         const auto wa = juce::GlyphArrangement::getStringWidth (font, a);
         const auto wb = juce::GlyphArrangement::getStringWidth (font, b);
-
-        const auto x = (float) headerArea.getX();
-        const auto y = (float) headerArea.getY() + 16.0f;
         const auto bx = x + wa + 14.0f;
 
         g.setFont (font);
@@ -294,7 +676,7 @@ void GrabEditor::paint (juce::Graphics& g)
         g.drawText (a, juce::Rectangle<float> (x, y, wa + 4.0f, 40.0f), juce::Justification::centredLeft, false);
         g.drawText (b, juce::Rectangle<float> (bx, y, wb + 4.0f, 40.0f), juce::Justification::centredLeft, false);
 
-        auto tag = headerArea.withTrimmedLeft ((int) (bx + wb + 24.0f) - headerArea.getX()).withTrimmedTop (16).withHeight (40);
+        auto tag = headerArea.withTrimmedLeft ((int) (bx + wb + 24.0f) - headerArea.getX()).withTrimmedTop (14).withHeight (40);
         g.setColour (brand::grey);
         g.setFont (fonts->bold (10.5f, 0.16f));
         g.drawFittedText ("DEL LINK AL WAV", tag, juce::Justification::centredRight, 1, 0.8f);
@@ -306,20 +688,27 @@ void GrabEditor::paint (juce::Graphics& g)
         g.setColour (showToast ? (toastError ? brand::yellow : brand::white) : brand::grey.withAlpha (0.75f));
         g.setFont (fonts->semi (11.5f));
         g.drawFittedText (showToast ? toastText
-                                    : TR ("YouTube · SoundCloud · Bandcamp · Spotify · Apple Music · Deezer · TIDAL · y más"),
-                          hintArea, juce::Justification::centredLeft, 1, 0.8f);
+                                    : TR ("YouTube, SoundCloud, Bandcamp: baja directo   ·   Spotify, Apple Music o texto: elegís entre opciones"),
+                          hintArea, juce::Justification::centredLeft, 1, 0.75f);
     }
 
-    // Lista vacía
-    if (items.empty())
+    if (! resultsVisible())
     {
-        auto r = list.getBounds().withTrimmedTop (list.getHeight() / 4);
-        g.setColour (brand::grey.withAlpha (0.5f));
-        g.setFont (fonts->title (34.0f, 0.06f));
-        g.drawText (TR ("COPIÁ UN LINK Y TOCÁ PEGAR"), r.removeFromTop (40), juce::Justification::centred, false);
-        g.setFont (fonts->semi (12.5f));
-        g.drawFittedText (TR ("Lo bajo como WAV y lo arrastrás a un track de Cubase."),
-                          r.removeFromTop (22), juce::Justification::centred, 1);
+        // Encabezado de la lista
+        g.setColour (brand::grey);
+        g.setFont (fonts->bold (10.5f, 0.16f));
+        g.drawText ("RECIENTES", listHeaderArea, juce::Justification::centredLeft, false);
+
+        if (items.empty())
+        {
+            auto r = list.getBounds().withTrimmedTop (list.getHeight() / 4);
+            g.setColour (brand::grey.withAlpha (0.5f));
+            g.setFont (fonts->title (32.0f, 0.06f));
+            g.drawText (TR ("COPIÁ UN LINK O ESCRIBÍ UN TEMA"), r.removeFromTop (40), juce::Justification::centred, false);
+            g.setFont (fonts->semi (12.5f));
+            g.drawFittedText (TR ("Lo bajo como WAV y lo arrastrás a un track de Cubase."),
+                              r.removeFromTop (22), juce::Justification::centred, 1);
+        }
     }
 
     // Pie
@@ -335,7 +724,7 @@ void GrabEditor::resized()
 {
     auto r = getLocalBounds().reduced (16, 0);
 
-    headerArea = r.removeFromTop (68);
+    headerArea = r.removeFromTop (72);
 
     auto row = r.removeFromTop (46);
     goButton.setBounds (row.removeFromRight (168));
@@ -360,7 +749,13 @@ void GrabEditor::resized()
     f.removeFromRight (8);
     folderButton.setBounds (f);
 
-    list.setBounds (r.withTrimmedBottom (6));
+    auto body = r.withTrimmedBottom (8);
+    results->setBounds (body);
+
+    listHeaderArea = body.removeFromTop (26);
+    clearButton.setBounds (listHeaderArea.removeFromRight (124).reduced (0, 1));
+    body.removeFromTop (2);
+    list.setBounds (body);
 }
 
 //==============================================================================
@@ -406,14 +801,15 @@ void GrabEditor::showRowMenu (int row, juce::Component* target)
     {
         m.addItem (TR ("Mostrar en la carpeta"), [f = item.file] { f.revealToUser(); });
         m.addItem (TR ("Copiar ruta"), [f = item.file] { juce::SystemClipboard::copyTextToClipboard (f.getFullPathName()); });
-        m.addSeparator();
-        m.addItem (TR ("Mandar a la papelera"), [safe, item]
+        m.addItem (TR ("Sacar de la lista (no borra el archivo)"), [safe, f = item.file]
         {
-            item.file.moveToTrash();
-            if (safe == nullptr) return;
-            if (item.jobId != 0) safe->engine.dismiss (item.jobId);
-            safe->rescanFolder();
-            safe->rebuildItems();
+            if (safe != nullptr) safe->engine.forget (f);
+        });
+        m.addSeparator();
+        m.addItem (TR ("Mandar el archivo a la papelera"), [safe, f = item.file]
+        {
+            f.moveToTrash();
+            if (safe != nullptr) safe->engine.forget (f);
         });
     }
     else if (item.kind == Item::Kind::failed)
@@ -429,7 +825,6 @@ void GrabEditor::showRowMenu (int row, juce::Component* target)
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (target));
 }
 
-//==============================================================================
 int GrabEditor::getNumRows()
 {
     return (int) items.size();
@@ -450,6 +845,201 @@ juce::Component* GrabEditor::refreshComponentForRow (int row, bool, juce::Compon
 }
 
 //==============================================================================
+// Buscador
+
+void GrabEditor::showResultsForTesting (const grab::Searcher::Result& r, int queueIndex, int queueTotal, int highlight)
+{
+    searcher.injectForTesting (r);
+    searchResult = searcher.getResult();
+    lastSearchRevision = searcher.getRevision();
+    pendingIndex = queueIndex;
+    pendingTotal = queueTotal;
+    results->setQueueInfo (queueIndex, queueTotal);
+    results->refresh();
+    highlighted = highlight;
+    showResults (true);
+}
+
+bool GrabEditor::resultsVisible() const
+{
+    return results != nullptr && results->isVisible();
+}
+
+void GrabEditor::showResults (bool show)
+{
+    if (show == resultsVisible())
+        return;
+
+    results->setVisible (show);
+    list.setVisible (! show);
+    clearButton.setVisible (! show && ! items.empty());
+    repaint();
+}
+
+void GrabEditor::setInputSilently (const juce::String& t)
+{
+    const juce::ScopedValueSetter<bool> svs (suppressTyping, true);
+    input.setText (t, false);
+    updateGoButton();
+}
+
+void GrabEditor::updateGoButton()
+{
+    const auto text = input.getText().trim();
+    juce::String platform;
+
+    if (text.isEmpty())
+        goButton.setButtonText (TR ("PEGAR Y BAJAR"));
+    else if (grab::classify (text, platform) == grab::LinkKind::direct)
+        goButton.setButtonText (TR ("BAJAR"));
+    else
+        goButton.setButtonText (TR ("BUSCAR"));
+}
+
+void GrabEditor::requestSearch (const juce::String& text, bool resolveLink, const grab::TrackQuery& expected)
+{
+    grab::Searcher::Request req;
+    req.text = text;
+    req.kind = searchKind;
+    req.resolveLink = resolveLink;
+    req.expected = expected;
+
+    if (resolveLink)
+    {
+        grab::classify (text, req.platform);
+        lastLinkRequested = text;
+    }
+    else if (expected.title.isNotEmpty())
+    {
+        req.platform = searchResult.request.platform;
+    }
+
+    searcher.request (req);
+    highlighted = -1;
+    showResults (true);
+}
+
+void GrabEditor::setSearchKind (grab::SearchKind k)
+{
+    searchKind = k;
+    const auto& r = searchResult;
+
+    if (r.query.isNotEmpty())
+        requestSearch (r.query, false, r.source);
+    else if (r.request.resolveLink && r.request.text.isNotEmpty())
+        requestSearch (r.request.text, true);
+}
+
+void GrabEditor::handleTyping()
+{
+    updateGoButton();
+
+    if (suppressTyping)
+        return;
+
+    const auto text = input.getText().trim();
+    searchDue = 0;
+
+    if (text.isEmpty())
+    {
+        if (resultsVisible() && pending.isEmpty())
+            closeResults();
+        return;
+    }
+
+    juce::String platform;
+    const auto kind = grab::classify (text, platform);
+
+    if (kind == grab::LinkKind::textSearch)
+    {
+        // Busca solo cuando dejás de escribir un ratito.
+        if (text.length() >= 2)
+            searchDue = juce::jmax ((juce::uint32) 1, juce::Time::getMillisecondCounter() + 550);
+    }
+    else if (kind == grab::LinkKind::streaming)
+    {
+        if (text != lastLinkRequested)
+            requestSearch (text, true);
+    }
+    else if (resultsVisible() && pending.isEmpty())
+    {
+        closeResults();
+        setInputSilently (text);
+    }
+}
+
+void GrabEditor::setHighlighted (int i)
+{
+    const auto n = (int) searchResult.items.size();
+    highlighted = n == 0 ? -1 : juce::jlimit (0, n - 1, i);
+    results->scrollToRow (highlighted);
+    results->repaintRows();
+}
+
+bool GrabEditor::keyPressed (const juce::KeyPress& key, juce::Component*)
+{
+    if (! resultsVisible() || searchResult.items.empty())
+        return false;
+
+    if (key == juce::KeyPress::downKey) { setHighlighted (highlighted + 1); return true; }
+    if (key == juce::KeyPress::upKey)   { setHighlighted (highlighted <= 0 ? 0 : highlighted - 1); return true; }
+    return false;
+}
+
+void GrabEditor::pick (int index)
+{
+    if (! juce::isPositiveAndBelow (index, (int) searchResult.items.size()))
+        return;
+
+    if (! engine.getToolStatus().installed)
+    {
+        toast (TR ("Primero tocá INSTALAR (es una sola vez)."), true);
+        return;
+    }
+
+    const auto c = searchResult.items[(size_t) index];
+    engine.enqueueDownload (c.url(), c.title, c.artist);
+    toast (TR ("Bajando: ") + c.niceName());
+    advanceAfterPick();
+}
+
+void GrabEditor::advanceAfterPick()
+{
+    if (! pending.isEmpty())
+        openNextPending();
+    else
+        closeResults();
+}
+
+void GrabEditor::openNextPending()
+{
+    if (pending.isEmpty())
+        return;
+
+    const auto text = pending[0];
+    pending.remove (0);
+    ++pendingIndex;
+
+    setInputSilently (text);
+    results->setQueueInfo (pendingIndex, pendingTotal);
+
+    juce::String platform;
+    requestSearch (text, grab::classify (text, platform) == grab::LinkKind::streaming);
+}
+
+void GrabEditor::closeResults()
+{
+    pending.clear();
+    pendingTotal = pendingIndex = 0;
+    searchDue = 0;
+    highlighted = -1;
+    lastLinkRequested = {};
+    searcher.clear();
+    results->setQueueInfo (0, 0);
+    setInputSilently ({});
+    showResults (false);
+}
+
 void GrabEditor::startFromUI()
 {
     auto text = input.getText().trim();
@@ -461,12 +1051,6 @@ void GrabEditor::startFromUI()
     if (text.isEmpty())
     {
         toast (TR ("No hay nada copiado. Copiá un link y tocá de nuevo."), true);
-        return;
-    }
-
-    if (! engine.getToolStatus().installed)
-    {
-        toast (TR ("Primero tocá INSTALAR (es una sola vez)."), true);
         return;
     }
 
@@ -482,30 +1066,61 @@ void GrabEditor::startFromUI()
             juce::String platform;
             if (lines.size() > 25 || (grab::classify (l, platform) == grab::LinkKind::textSearch && l.length() > 90))
             {
-                input.setText (text.substring (0, 300), false);
-                toast (TR ("Lo copiado no parece un link. Revisalo en el campo y tocá BAJAR."), true);
-                goButton.setButtonText (TR ("BAJAR"));
+                setInputSilently (text.substring (0, 300));
+                toast (TR ("Lo copiado no parece un link. Revisalo en el campo y tocá BUSCAR."), true);
                 return;
             }
         }
     }
 
-    for (auto& l : lines)
-        engine.enqueueDownload (l);
+    juce::StringArray direct, toChoose;
 
-    input.clear();
-    goButton.setButtonText (TR ("PEGAR Y BAJAR"));
-    toast (lines.size() == 1 ? TR ("En camino…") : TR ("En camino: ") + juce::String (lines.size()) + TR (" temas"));
-    rebuildItems();
+    for (auto& l : lines)
+    {
+        juce::String platform;
+        (grab::classify (l, platform) == grab::LinkKind::direct ? direct : toChoose).add (l);
+    }
+
+    if (! direct.isEmpty())
+    {
+        if (! engine.getToolStatus().installed)
+        {
+            toast (TR ("Primero tocá INSTALAR (es una sola vez)."), true);
+            return;
+        }
+
+        for (auto& l : direct)
+            engine.enqueueDownload (l);
+
+        toast (direct.size() == 1 ? TR ("En camino…") : TR ("En camino: ") + juce::String (direct.size()) + TR (" links"));
+    }
+
+    if (toChoose.isEmpty())
+    {
+        setInputSilently ({});
+        if (resultsVisible() && pending.isEmpty())
+            closeResults();
+        return;
+    }
+
+    // Spotify, Apple, texto: uno por uno, eligiendo la opción.
+    searchDue = 0;
+    pending = toChoose;
+    pendingTotal = toChoose.size();
+    pendingIndex = 0;
+    lastLinkRequested = {};
+    openNextPending();
 }
 
+//==============================================================================
 void GrabEditor::showSettings()
 {
     const auto st = engine.getToolStatus();
     juce::Component::SafePointer<GrabEditor> safe (this);
     juce::PopupMenu m;
 
-    m.addSectionHeader ("CLARABOYA GRAB 1.0" + (st.version.isNotEmpty() ? "   yt-dlp " + st.version : juce::String()));
+    m.addSectionHeader ("CLARABOYA GRAB " CLARABOYA_GRAB_VERSION
+                        + (st.version.isNotEmpty() ? "   yt-dlp " + st.version : juce::String()));
     m.addItem (TR ("Cambiar carpeta de descarga…"), [safe] { if (safe != nullptr) safe->chooseFolder(); });
     m.addItem (TR ("Abrir carpeta"), [safe]
     {
@@ -515,6 +1130,21 @@ void GrabEditor::showSettings()
         d.startAsProcess();
     });
     m.addSeparator();
+
+    if (engine.followsHostRate())
+    {
+        m.addItem (TR ("Frecuencia del WAV: la de la sesión (") + grab::formatRate (engine.getTargetSampleRate()) + ")",
+                   false, true, [] {});
+    }
+    else
+    {
+        juce::PopupMenu rates;
+        for (auto sr : { 44100.0, 48000.0, 88200.0, 96000.0 })
+            rates.addItem (grab::formatRate (sr), true, std::abs (engine.getAppSampleRate() - sr) < 1.0,
+                           [safe, sr] { if (safe != nullptr) { safe->engine.setAppSampleRate (sr); safe->repaint(); } });
+        m.addSubMenu (TR ("Frecuencia del WAV (") + grab::formatRate (engine.getAppSampleRate()) + ")", rates);
+    }
+
     m.addItem (TR ("Usar sesión de Firefox (si YouTube pide iniciar sesión)"), true, engine.getUseFirefoxCookies(), [safe]
     {
         if (safe != nullptr)
@@ -522,12 +1152,10 @@ void GrabEditor::showSettings()
     });
     m.addSeparator();
     m.addItem (TR ("Actualizar yt-dlp"), st.installed && ! st.busy, false, [safe] { if (safe != nullptr) safe->engine.enqueueUpdateYtdlp(); });
-   #if JUCE_WINDOWS
-    m.addItem (TR ("Reinstalar herramientas"), ! st.busy, false, [safe] { if (safe != nullptr) safe->engine.enqueueInstallTools (true); });
-   #endif
-    m.addItem (TR ("Limpiar la lista de recientes"), [safe] { if (safe != nullptr) safe->engine.clearFinished(); });
+    if (grab::Tools::canAutoInstall())
+        m.addItem (TR ("Reinstalar herramientas"), ! st.busy, false, [safe] { if (safe != nullptr) safe->engine.enqueueInstallTools (true); });
 
-    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&settingsButton).withMinimumWidth (320));
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&settingsButton).withMinimumWidth (340));
 }
 
 void GrabEditor::chooseFolder()
@@ -543,31 +1171,16 @@ void GrabEditor::chooseFolder()
                               if (! f.isDirectory()) return;
 
                               safe->engine.setOutputFolder (f);
-                              safe->rescanFolder();
-                              safe->rebuildItems();
-                              safe->toast (TR ("Carpeta cambiada"));
+                              safe->updateFolderLabel();
+                              safe->toast (TR ("Carpeta cambiada. Lo nuevo se guarda ahí."));
                           });
 }
 
-//==============================================================================
-void GrabEditor::rescanFolder()
+void GrabEditor::updateFolderLabel()
 {
     const auto dir = engine.getOutputFolder();
-    auto files = dir.findChildFiles (juce::File::findFiles | juce::File::ignoreHiddenFiles, false, "*.wav");
-
-    std::sort (files.begin(), files.end(), [] (const juce::File& a, const juce::File& b)
-    {
-        return a.getLastModificationTime() > b.getLastModificationTime();
-    });
-
-    if (files.size() > 80)
-        files.removeRange (80, files.size() - 80);
-
-    folderFiles = files;
     lastFolder = dir;
-    lastScan = juce::Time::getMillisecondCounter();
 
-    // Ruta corta: …\Carpeta\Subcarpeta
     auto path = dir.getFullPathName();
     if (path.length() > 46)
         path = juce::String::fromUTF8 ("…") + juce::File::getSeparatorString()
@@ -578,8 +1191,7 @@ void GrabEditor::rescanFolder()
 
 juce::String GrabEditor::fileInfo (const juce::File& f)
 {
-    const auto modified = f.getLastModificationTime();
-    const auto key = f.getFullPathName() + "@" + juce::String (modified.toMilliseconds());
+    const auto key = f.getFullPathName() + "@" + juce::String (f.getLastModificationTime().toMilliseconds());
 
     if (auto found = infoCache.find (key); found != infoCache.end())
         return found->second;
@@ -590,11 +1202,6 @@ juce::String GrabEditor::fileInfo (const juce::File& f)
         s = grab::formatDuration ((double) r->lengthInSamples / r->sampleRate) + TR (" · ")
           + grab::formatRate (r->sampleRate) + " / " + juce::String ((int) r->bitsPerSample) + " bit";
 
-    const auto now = juce::Time::getCurrentTime();
-    const bool today = modified.getYear() == now.getYear() && modified.getDayOfYear() == now.getDayOfYear();
-    const auto when = today ? "hoy " + modified.formatted ("%H:%M") : modified.formatted ("%d/%m %H:%M");
-
-    s = s.isNotEmpty() ? s + TR (" · ") + when : when;
     infoCache[key] = s;
     return s;
 }
@@ -602,7 +1209,6 @@ juce::String GrabEditor::fileInfo (const juce::File& f)
 void GrabEditor::rebuildItems()
 {
     std::vector<Item> next;
-    juce::Array<juce::File> fromJobs;
 
     const auto jobs = engine.getJobs();
 
@@ -612,45 +1218,30 @@ void GrabEditor::rebuildItems()
         i.jobId = it->id;
         i.title = it->title;
         i.sub = it->detail;
-        i.warning = it->warning;
         i.progress = it->progress;
-
-        if (it->state == grab::Job::State::done)
-        {
-            if (! it->result.existsAsFile())
-            {
-                engine.dismiss (it->id);
-                continue;
-            }
-
-            i.kind = Item::Kind::doneJob;
-            i.file = it->result;
-            fromJobs.add (it->result);
-        }
-        else
-        {
-            i.kind = it->state == grab::Job::State::failed ? Item::Kind::failed : Item::Kind::active;
-        }
-
+        i.kind = it->state == grab::Job::State::failed ? Item::Kind::failed : Item::Kind::active;
         next.push_back (i);
     }
 
-    for (auto& f : folderFiles)
+    for (auto& h : engine.getHistory())
     {
-        if (fromJobs.contains (f) || ! f.existsAsFile())
+        if (! h.file.existsAsFile())
             continue;
 
         Item i;
         i.kind = Item::Kind::file;
-        i.file = f;
-        i.title = f.getFileNameWithoutExtension();
-        i.sub = fileInfo (f);
+        i.file = h.file;
+        i.title = h.title.isNotEmpty() ? h.title : h.file.getFileNameWithoutExtension();
+
+        auto info = h.detail.isNotEmpty() ? h.detail : fileInfo (h.file);
+        const auto when = whenText (h.time);
+        i.sub = info.isNotEmpty() && when.isNotEmpty() ? info + TR (" · ") + when : info + when;
         next.push_back (i);
     }
 
     juce::String sig;
     for (auto& i : next)
-        sig << (int) i.kind << '|' << i.title << '|' << i.sub << '|' << i.warning << '|' << (int) (i.progress * 100.0f) << '\n';
+        sig << (int) i.kind << '|' << i.title << '|' << i.sub << '|' << (int) (i.progress * 100.0f) << '\n';
 
     const bool emptinessChanged = next.empty() != items.empty();
     items = std::move (next);
@@ -661,6 +1252,8 @@ void GrabEditor::rebuildItems()
         list.updateContent();
         list.repaint();
     }
+
+    clearButton.setVisible (! resultsVisible() && ! items.empty());
 
     if (emptinessChanged)
         repaint();
@@ -696,23 +1289,55 @@ void GrabEditor::toast (const juce::String& s, bool isError)
 void GrabEditor::timerCallback()
 {
     const auto now = juce::Time::getMillisecondCounter();
-    const auto rev = engine.getRevision();
 
-    if (engine.getOutputFolder() != lastFolder || now - lastScan > 1500)
+    // Búsqueda mientras escribís
+    if (searchDue != 0 && now >= searchDue)
     {
-        rescanFolder();
-        rebuildItems();
+        searchDue = 0;
+        const auto text = input.getText().trim();
+        juce::String platform;
+
+        if (text.length() >= 2 && grab::classify (text, platform) == grab::LinkKind::textSearch)
+            requestSearch (text, false);
     }
 
-    if (rev != lastRevision)
+    if (const auto rev = searcher.getRevision(); rev != lastSearchRevision)
+    {
+        lastSearchRevision = rev;
+        searchResult = searcher.getResult();
+
+        if (highlighted >= (int) searchResult.items.size())
+            highlighted = -1;
+
+        results->refresh();
+    }
+
+    if (const auto rev = processorRef.thumbs.getRevision(); rev != lastThumbRevision)
+    {
+        lastThumbRevision = rev;
+        if (resultsVisible())
+            results->repaintRows();
+    }
+
+    if (resultsVisible())
+    {
+        using State = grab::Searcher::Result::State;
+        if (searchResult.state == State::resolving || searchResult.state == State::searching)
+            results->repaint();
+    }
+
+    if (engine.getOutputFolder() != lastFolder)
+        updateFolderLabel();
+
+    if (const auto rev = engine.getRevision(); rev != lastRevision || now - lastRebuild > 3000)
     {
         lastRevision = rev;
+        lastRebuild = now;
         rebuildItems();
         updateBanner();
         repaint (footerInfoArea);
     }
 
-    // Animación de las barras sin porcentaje.
     for (auto& i : items)
         if (i.kind == Item::Kind::active && i.progress < 0.0f)
             { list.repaint(); break; }

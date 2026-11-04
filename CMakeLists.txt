@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(ClaraboyaGrab VERSION 1.0.0 LANGUAGES C CXX)
+project(ClaraboyaGrab VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(CLARABOYA_BUILD_TESTS "Compilar el programa de pruebas (solo desarrollo)" OFF)
+
+add_compile_definitions(CLARABOYA_GRAB_VERSION="${PROJECT_VERSION}")
 
 include(FetchContent)
 FetchContent_Declare(JUCE
@@ -21,11 +23,14 @@ juce_add_binary_data(ClaraboyaGrabData
     SOURCES
         Resources/BebasNeue-Regular.ttf
         Resources/Montserrat-SemiBold.ttf
-        Resources/Montserrat-Bold.ttf)
+        Resources/Montserrat-Bold.ttf
+        Resources/brand/logo-cabecera.png
+        Resources/brand/icono-chico-256.png)
 
-# Motor: descargas, búsqueda en YouTube Music y conversión a WAV.
+# Motor: descargas, buscador (YouTube Music) y conversión a WAV.
 set(GRAB_ENGINE_SOURCES
     Source/Resolver.cpp
+    Source/Search.cpp
     Source/Tools.cpp
     Source/GrabEngine.cpp)
 
@@ -44,12 +49,15 @@ juce_add_plugin(ClaraboyaGrab
     COPY_PLUGIN_AFTER_BUILD   FALSE
     VST3_CATEGORIES           Fx Tools
     NEEDS_CURL                TRUE
+    ICON_BIG                  Resources/brand/icono-1024.png
+    ICON_SMALL                Resources/brand/icono-chico-256.png
     BUNDLE_ID                 ar.claraboya.grab)
 
 target_sources(ClaraboyaGrab PRIVATE
     ${GRAB_ENGINE_SOURCES}
     Source/PluginProcessor.cpp
-    Source/PluginEditor.cpp)
+    Source/PluginEditor.cpp
+    Source/StandaloneApp.cpp)
 
 target_include_directories(ClaraboyaGrab PRIVATE Source)
 
@@ -57,7 +65,8 @@ target_compile_definitions(ClaraboyaGrab PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=1
     JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0)
+    JUCE_DISPLAY_SPLASH_SCREEN=0
+    JUCE_USE_CUSTOM_PLUGIN_STANDALONE_APP=1)
 
 target_link_libraries(ClaraboyaGrab
     PRIVATE
@@ -84,6 +93,7 @@ if(CLARABOYA_BUILD_TESTS)
         juce::juce_core
         juce::juce_events
         juce::juce_data_structures
+        juce::juce_graphics
         juce::juce_audio_formats
         juce::juce_recommended_config_flags)
 

@@ -2,10 +2,10 @@
 
 Plugin VST3 para Cubase (Windows). Pegás un link, lo baja como WAV a la frecuencia de la sesión (24 bit) y lo arrastrás a un track.
 
-- **Directo:** YouTube, YouTube Music, SoundCloud, Bandcamp, Vimeo, Instagram, TikTok, Facebook, Mixcloud y todo lo que soporta yt-dlp.
-- **Spotify, Apple Music, Deezer, TIDAL, Amazon Music:** el audio de esas plataformas viene cifrado, así que no se baja de ahí. El plugin lee qué tema es (artista, título, duración) y baja ese mismo tema de YouTube Music. Si la duración no coincide con la original, te avisa en amarillo (puede ser otra versión o un remaster).
-- **Texto suelto:** escribí "artista tema" y lo busca en YouTube Music.
-- Podés pegar varios links a la vez (uno por línea).
+- **Directo:** YouTube, YouTube Music, SoundCloud, Bandcamp, Vimeo, Instagram, TikTok, Facebook, Mixcloud y todo lo que soporta yt-dlp. Pegás el link y baja.
+- **Spotify, Apple Music, Deezer, TIDAL, Amazon Music:** el audio de esas plataformas viene cifrado, así que no se baja de ahí. El plugin lee qué tema es (artista, título, duración) y te muestra **opciones de YouTube Music** para que elijas cuál bajar. Arriba quedan las más parecidas y la que dura lo mismo que el original lleva la marca **MISMA DURACIÓN**.
+- **Texto:** escribí "artista tema" y mientras escribís aparecen las opciones (con tapa, disco y duración). Pestañas **CANCIONES** (audio de estudio) y **VIDEOS** (videoclips, vivos, etc.).
+- Podés pegar varios links a la vez (uno por línea): los directos bajan solos y los de Spotify/texto te los va mostrando de a uno ("TEMA 1 DE 3", con **SALTEAR**).
 
 No toca el audio del canal donde lo pongas: es solo la ventana del bajador.
 
@@ -31,14 +31,14 @@ No toca el audio del canal donde lo pongas: es solo la ventana del bajador.
 2. En Cubase: Studio › VST Plug-in Manager › actualizar. Aparece en **Tools › Claraboya Grab**.
 3. Cargalo como insert en cualquier canal. La primera vez tocá **INSTALAR**: baja yt-dlp, FFmpeg y Deno (unos 200 MB) a `%APPDATA%\Claraboya Grab\bin`. Es una sola vez.
 
-También queda `Claraboya Grab.exe`, la misma herramienta como programa suelto, por si la querés usar fuera de Cubase.
+También queda `Claraboya Grab.exe` (en la carpeta `Standalone`), la misma herramienta como programa suelto, con el ícono de Claraboya. Ahí la frecuencia del WAV se elige en **AJUSTES** (en Cubase sigue a la sesión).
 
 ## 3. Usarlo
 1. Copiá un link (o escribí artista y tema en el campo).
-2. **PEGAR Y BAJAR** (si el campo está vacío, toma lo que tengas copiado).
+2. **PEGAR Y BAJAR** (si el campo está vacío, toma lo que tengas copiado). Con un link de YouTube baja directo; con Spotify o un texto aparecen las opciones: clic en la que quieras (o flechas y Enter). **CERRAR** o Esc para salir.
 3. Cuando aparece **ARRASTRÁ**, arrastrá la fila al proyecto. Cubase crea el track solo.
 
-Con clic derecho en una fila: mostrar en la carpeta, copiar ruta o mandar a la papelera. Doble clic la abre en el Explorador.
+**LIMPIAR LISTA** vacía la lista de recientes; los WAV siguen en la carpeta. Con clic derecho en una fila: mostrar en la carpeta, copiar ruta, sacar de la lista o mandar el archivo a la papelera. Doble clic la abre en el Explorador.
 
 Los WAV quedan en `Documentos\Claraboya Grab` (se cambia en **AJUSTES**). Conviene que Cubase copie lo que importás a la carpeta del proyecto, así la sesión no depende de esa carpeta.
 
@@ -55,8 +55,10 @@ Bajar de estas plataformas va contra sus términos de uso: pensado para escuchar
 ---
 
 ### Para desarrollo
-- `Source/Resolver.cpp`: qué hacer con cada link (streaming → YouTube Music).
-- `Source/GrabEngine.cpp`: cola de descargas, yt-dlp, FFmpeg, instalador.
-- `Source/PluginEditor.cpp`: interfaz.
-- Pruebas: `cmake -B build -DCLARABOYA_BUILD_TESTS=ON` y correr `ClaraboyaGrabTests`.
+- `Source/Resolver.cpp`: qué tema es cada link (Spotify por su página "embed", Apple por iTunes, Deezer por su API).
+- `Source/Search.cpp`: buscador de YouTube Music con opciones (y respaldo con yt-dlp), orden por parecido y duración.
+- `Source/GrabEngine.cpp`: cola de descargas, historial, yt-dlp, FFmpeg, instalador.
+- `Source/PluginEditor.cpp`: interfaz. `Source/StandaloneApp.cpp`: ventana de la app suelta.
+- Pruebas: `cmake -B build -DCLARABOYA_BUILD_TESTS=ON` y correr `ClaraboyaGrabTests` (con `--live` prueba contra Spotify y YouTube Music de verdad; en GitHub corre solo en cada rama que no sea `main`).
+- Logo e íconos: `Resources/brand/` (se regeneran con `tools/make_icons.py` a partir de la claraboya bordó).
 - Tipografías Bebas Neue y Montserrat bajo licencia SIL OFL (`Resources/`).

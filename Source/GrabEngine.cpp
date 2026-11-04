@@ -29,6 +29,8 @@ Engine::Engine() : juce::Thread ("Claraboya Grab")
     o.millisecondsBeforeSaving = -1;   // se guarda a mano, sin timers
     props.setStorageParameters (o);
 
+    loadHistory();
+
     tools.installed = Tools::allInstalled();
     tools.text = tools.installed ? TR ("Herramientas listas") : TR ("Faltan las herramientas");
 
@@ -69,10 +71,124 @@ Engine::~Engine()
 }
 
 //==============================================================================
-double Engine::getTargetSampleRate() const noexcept
+double Engine::getTargetSampleRate() const
 {
     auto sr = sampleRate.load();
-    return sr > 0.0 ? sr : 48000.0;
+    return sr > 0.0 ? sr : getAppSampleRate();
+}
+
+double Engine::getAppSampleRate() const
+{
+    const juce::ScopedLock sl (settingsLock);
+    const auto sr = props.getUserSettings()->getDoubleValue ("appSampleRate", 48000.0);
+    return sr >= 8000.0 && sr <= 384000.0 ? sr : 48000.0;
+}
+
+void Engine::setAppSampleRate (double sr)
+{
+    {
+        const juce::ScopedLock sl (settingsLock);
+        props.getUserSettings()->setValue ("appSampleRate", sr);
+        props.saveIfNeeded();
+    }
+    bump();
+}
+
+//==============================================================================
+juce::File Engine::historyFile()
+{
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+               .getChildFile ("Claraboya Grab").getChildFile ("historial.json");
+}
+
+void Engine::loadHistory()
+{
+    const auto f = historyFile();
+    std::vector<HistoryItem> items;
+
+    if (f.existsAsFile())
+    {
+        const auto parsed = juce::JSON::parse (f);   // tiene que vivir mientras se recorre
+
+        if (auto* arr = parsed.getArray())
+        {
+            for (auto& v : *arr)
+            {
+                HistoryItem h;
+                h.file   = absoluteOrNone (v.getProperty ("path", {}).toString());
+                h.title  = v.getProperty ("title", {}).toString();
+                h.detail = v.getProperty ("detail", {}).toString();
+                h.time   = (juce::int64) v.getProperty ("time", 0);
+
+                if (h.file.existsAsFile())
+                    items.push_back (h);
+            }
+        }
+    }
+    else
+    {
+        // Primera vez con historial: arrancar con lo último que ya hay en la carpeta.
+        auto wavs = getOutputFolder().findChildFiles (juce::File::findFiles | juce::File::ignoreHiddenFiles, false, "*.wav");
+        std::sort (wavs.begin(), wavs.end(), [] (const juce::File& a, const juce::File& b)
+        {
+            return a.getLastModificationTime() > b.getLastModificationTime();
+        });
+
+        for (int i = 0; i < juce::jmin (30, wavs.size()); ++i)
+            items.push_back ({ wavs[i], wavs[i].getFileNameWithoutExtension(), {},
+                               wavs[i].getLastModificationTime().toMilliseconds() });
+    }
+
+    const juce::ScopedLock sl (lock);
+    history = std::move (items);
+    saveHistory();
+}
+
+void Engine::saveHistory()
+{
+    juce::Array<juce::var> arr;
+
+    for (auto& h : history)
+    {
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("path", h.file.getFullPathName());
+        o->setProperty ("title", h.title);
+        o->setProperty ("detail", h.detail);
+        o->setProperty ("time", h.time);
+        arr.add (juce::var (o));
+    }
+
+    const auto f = historyFile();
+    f.getParentDirectory().createDirectory();
+    f.replaceWithText (juce::JSON::toString (juce::var (arr)));
+}
+
+std::vector<HistoryItem> Engine::getHistory() const
+{
+    const juce::ScopedLock sl (lock);
+    return history;
+}
+
+void Engine::clearList()
+{
+    {
+        const juce::ScopedLock sl (lock);
+        history.clear();
+        jobs.erase (std::remove_if (jobs.begin(), jobs.end(), [] (const Job& j) { return ! j.isActive(); }), jobs.end());
+        saveHistory();
+    }
+    bump();
+}
+
+void Engine::forget (const juce::File& file)
+{
+    {
+        const juce::ScopedLock sl (lock);
+        history.erase (std::remove_if (history.begin(), history.end(), [&] (const HistoryItem& h) { return h.file == file; }),
+                       history.end());
+        saveHistory();
+    }
+    bump();
 }
 
 juce::File Engine::getOutputFolder() const
@@ -176,7 +292,7 @@ bool Engine::waitUntilIdle (int timeoutMs)
 }
 
 //==============================================================================
-void Engine::enqueueDownload (const juce::String& raw)
+void Engine::enqueueDownload (const juce::String& raw, const juce::String& titleHint, const juce::String& artistHint)
 {
     auto input = raw.trim();
     if (input.isEmpty())
@@ -189,7 +305,9 @@ void Engine::enqueueDownload (const juce::String& raw)
         Job j;
         j.id = id = nextJobId++;
         j.input = input;
-        j.title = input;
+        j.titleHint = titleHint;
+        j.artistHint = artistHint;
+        j.title = titleHint.isNotEmpty() ? makeNiceName (titleHint, artistHint) : input;
         classify (input, j.platform);
         j.detail = j.platform + TR (" · en cola…");
         jobs.push_back (j);
@@ -206,7 +324,7 @@ void Engine::retry (int jobId)
         return;
 
     dismiss (jobId);
-    enqueueDownload (j.input);
+    enqueueDownload (j.input, j.titleHint, j.artistHint);
 }
 
 void Engine::enqueueInstallTools (bool forceAll)
@@ -282,15 +400,6 @@ void Engine::dismiss (int jobId)
     if (active)
         cancel (jobId);
 
-    bump();
-}
-
-void Engine::clearFinished()
-{
-    {
-        const juce::ScopedLock sl (lock);
-        jobs.erase (std::remove_if (jobs.begin(), jobs.end(), [] (const Job& j) { return ! j.isActive(); }), jobs.end());
-    }
     bump();
 }
 
@@ -443,63 +552,19 @@ void Engine::doDownload (int jobId)
         return fail (jobId, TR ("No pude crear la carpeta de descarga: ") + outDir.getFullPathName());
 
     juce::String platform;
-    const auto kind = classify (job.input, platform);
 
-    juce::String url, label;
-    bool search = false;
-    double expected = 0.0;
+    if (classify (job.input, platform) != LinkKind::direct)
+        return fail (jobId, TR ("Para Spotify, Apple Music o una búsqueda, elegí el tema en el buscador."));
 
-    if (kind == LinkKind::streaming)
+    const auto label = platform;
+    const auto url = normaliseUrl (job.input);
+
+    updateJob (jobId, [&] (Job& j)
     {
-        label = platform + TR (" › YouTube Music");
-        updateJob (jobId, [&] (Job& j)
-        {
-            j.state = Job::State::resolving;
-            j.platform = platform;
-            j.viaMatch = true;
-            j.detail = TR ("Leyendo el tema en ") + platform + TR ("…");
-        });
-
-        const auto q = resolveStreaming (normaliseUrl (job.input), platform);
-
-        if (isCancelled (jobId)) return removeJob();
-        if (q.error.isNotEmpty()) return fail (jobId, q.error);
-
-        expected = q.durationSec;
-        updateJob (jobId, [&] (Job& j)
-        {
-            j.title = q.displayName();
-            j.detail = label + TR (" · buscando el mismo tema…");
-        });
-
-        url = buildYTMusicSearchUrl (q.searchText());
-        search = true;
-    }
-    else if (kind == LinkKind::textSearch)
-    {
-        label = "YouTube Music";
-        updateJob (jobId, [&] (Job& j)
-        {
-            j.state = Job::State::resolving;
-            j.platform = TR ("Búsqueda");
-            j.viaMatch = true;
-            j.detail = TR ("Buscando en YouTube Music…");
-        });
-
-        url = buildYTMusicSearchUrl (job.input);
-        search = true;
-    }
-    else
-    {
-        label = platform;
-        url = normaliseUrl (job.input);
-        updateJob (jobId, [&] (Job& j)
-        {
-            j.state = Job::State::downloading;
-            j.platform = platform;
-            j.detail = label + TR (" · conectando…");
-        });
-    }
+        j.state = Job::State::downloading;
+        j.platform = platform;
+        j.detail = label + TR (" · conectando…");
+    });
 
     const auto tmpRoot = outDir.getChildFile (".claraboya-tmp");
     const auto tmp = tmpRoot.getChildFile (juce::String (jobId) + "-"
@@ -540,15 +605,7 @@ void Engine::doDownload (int jobId)
     args.add ("--progress-template");
     args.add ("download:PROG|%(progress._percent_str)s");
 
-    if (search)
-    {
-        args.add ("--playlist-items");
-        args.add ("1");
-    }
-    else
-    {
-        args.add ("--no-playlist");
-    }
+    args.add ("--no-playlist");
 
     if (getUseFirefoxCookies())
     {
@@ -601,7 +658,8 @@ void Engine::doDownload (int jobId)
             updateJob (jobId, [&] (Job& j)
             {
                 j.state = Job::State::downloading;
-                j.title = makeNiceName (infoTitle, infoArtist);
+                if (j.titleHint.isEmpty())
+                    j.title = makeNiceName (infoTitle, infoArtist);
                 j.detail = label + (duration > 0 ? TR (" · ") + formatDuration (duration) : juce::String()) + TR (" · arrancando…");
             });
         }
@@ -637,19 +695,19 @@ void Engine::doDownload (int jobId)
         if (code == -1000)
             return fail (jobId, TR ("No pude ejecutar yt-dlp. Probá «Reinstalar herramientas» en AJUSTES."));
 
-        if (code == 0 && search && lastError.isEmpty())
-            return fail (jobId, TR ("No encontré ese tema en YouTube Music."));
-
-        return fail (jobId, friendlyError (lastError, search));
+        return fail (jobId, friendlyError (lastError));
     }
 
     //==============================================================================
     // 2) FFmpeg lo pasa a WAV 24 bit a la frecuencia de la sesión.
     const auto sr = getTargetSampleRate();
 
-    auto name = juce::File::createLegalFileName (makeNiceName (infoTitle.isNotEmpty() ? infoTitle
-                                                                                      : downloaded.getFileNameWithoutExtension(),
-                                                               infoArtist)).trim().trimCharactersAtEnd (". ");
+    // Nombre: el del tema elegido en el buscador, si no lo que informa la plataforma.
+    const auto niceName = job.titleHint.isNotEmpty()
+                        ? makeNiceName (job.titleHint, job.artistHint)
+                        : makeNiceName (infoTitle.isNotEmpty() ? infoTitle : downloaded.getFileNameWithoutExtension(), infoArtist);
+
+    auto name = juce::File::createLegalFileName (niceName).trim().trimCharactersAtEnd (". ");
     if (name.length() > 120) name = name.substring (0, 120).trim();
     if (name.isEmpty())      name = "audio";
 
@@ -691,31 +749,40 @@ void Engine::doDownload (int jobId)
                                                                                 : juce::String (".")));
     }
 
-    juce::String warning;
-    if (search && expected > 0.0 && duration > 0.0 && std::abs (duration - expected) > 4.0)
-        warning = TR ("Ojo: dura ") + formatDuration (duration) + TR (" y el original ") + formatDuration (expected)
-                + TR (". Puede ser otra versión.");
-
-    updateJob (jobId, [&] (Job& j)
+    // Listo: pasa de la cola al historial.
     {
-        j.state = Job::State::done;
-        j.progress = 1.0f;
-        j.result = wav;
-        j.title = wav.getFileNameWithoutExtension();
-        j.detail = label + (duration > 0 ? TR (" · ") + formatDuration (duration) : juce::String())
+        const juce::ScopedLock sl (lock);
+
+        HistoryItem h;
+        h.file = wav;
+        h.title = wav.getFileNameWithoutExtension();
+        h.detail = label + (duration > 0 ? TR (" · ") + formatDuration (duration) : juce::String())
                  + TR (" · ") + formatRate (sr) + " / 24 bit";
-        j.warning = warning;
-    });
+        h.time = juce::Time::currentTimeMillis();
+
+        history.erase (std::remove_if (history.begin(), history.end(), [&] (const HistoryItem& x) { return x.file == wav; }),
+                       history.end());
+        history.insert (history.begin(), h);
+        if (history.size() > 200)
+            history.resize (200);
+        saveHistory();
+
+        jobs.erase (std::remove_if (jobs.begin(), jobs.end(), [jobId] (const Job& j) { return j.id == jobId; }), jobs.end());
+    }
+
+    bump();
 }
 
-juce::String Engine::friendlyError (const juce::String& e, bool wasSearch)
+juce::String Engine::friendlyError (const juce::String& e)
 {
     auto has = [&e] (const char* s) { return e.containsIgnoreCase (juce::String (s)); };
 
     if (e.isEmpty())
-        return wasSearch ? TR ("No encontré ese tema en YouTube Music.") : TR ("Algo falló al bajar. Probá de nuevo.");
+        return TR ("Algo falló al bajar. Probá de nuevo.");
 
     if (has ("Unsupported URL"))                        return TR ("Ese link no es compatible.");
+    if (has ("Incomplete YouTube ID") || has ("truncated_id") || has ("is not a valid URL"))
+        return TR ("El link está incompleto: copialo de nuevo.");
     if (has ("firefox"))                                return TR ("No pude leer la sesión de Firefox. ¿Está instalado? Si no, desactivalo en AJUSTES.");
     if (has ("Private video"))                          return TR ("El video es privado.");
     if (has ("confirm your age") || has ("age-restricted") || has ("inappropriate for some users"))
@@ -735,7 +802,15 @@ juce::String Engine::friendlyError (const juce::String& e, bool wasSearch)
     if (has ("timed out") || has ("getaddrinfo") || has ("Connection") || has ("Unable to download webpage"))
         return TR ("Problema de conexión. Revisá internet y probá de nuevo.");
 
-    return e.substring (0, 160);
+    // Otro error: sin el "[plataforma] id:" del principio.
+    auto clean = e.trim();
+    if (clean.startsWithChar ('['))
+        clean = clean.fromFirstOccurrenceOf ("] ", false, false);
+    if (const auto head = clean.upToFirstOccurrenceOf (": ", false, false); head.isNotEmpty() && ! head.containsChar (' ')
+                                                                           && clean.contains (": "))
+        clean = clean.fromFirstOccurrenceOf (": ", false, false);
+
+    return clean.substring (0, 160);
 }
 
 //==============================================================================

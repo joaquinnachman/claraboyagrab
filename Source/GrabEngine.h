@@ -18,18 +18,26 @@ namespace grab
         enum class State { queued, resolving, downloading, converting, done, failed };
 
         int id = 0;
-        juce::String input;        // lo que pegó el usuario
+        juce::String input;        // el link a bajar
+        juce::String titleHint, artistHint;   // si vino del buscador: nombre prolijo del tema
         juce::String platform;     // "YouTube", "Spotify", "Búsqueda"…
         juce::String title;        // lo que se muestra en la lista
         juce::String detail;       // segunda línea (estado, error, datos del WAV)
         juce::String warning;      // ej.: la duración no coincide con el original
         State state = State::queued;
         float progress = -1.0f;    // < 0: sin porcentaje
-        bool viaMatch = false;     // vino de Spotify/Apple/etc. o de una búsqueda
         juce::File result;
 
         bool isActive() const noexcept { return state == State::queued || state == State::resolving
                                              || state == State::downloading || state == State::converting; }
+    };
+
+    /** Lo que ya se bajó. Vive aparte de los archivos: limpiar la lista no borra nada del disco. */
+    struct HistoryItem
+    {
+        juce::File file;
+        juce::String title, detail;
+        juce::int64 time = 0;       // ms desde 1970
     };
 
     struct ToolStatus
@@ -51,7 +59,12 @@ namespace grab
         ~Engine() override;
 
         void setSampleRate (double sr) noexcept       { if (sr > 0.0) sampleRate.store (sr); }
-        double getTargetSampleRate() const noexcept;
+        double getTargetSampleRate() const;
+
+        /** App suelta: no hay sesión, la frecuencia del WAV se elige en AJUSTES. */
+        bool followsHostRate() const noexcept          { return sampleRate.load() > 0.0; }
+        double getAppSampleRate() const;
+        void setAppSampleRate (double);
 
         juce::File getOutputFolder() const;
         void setOutputFolder (const juce::File&);
@@ -59,15 +72,20 @@ namespace grab
         bool getUseFirefoxCookies() const;
         void setUseFirefoxCookies (bool);
 
-        void enqueueDownload (const juce::String& input);
+        void enqueueDownload (const juce::String& url, const juce::String& titleHint = {},
+                              const juce::String& artistHint = {});
         void retry (int jobId);
         void enqueueInstallTools (bool forceAll);
         void enqueueUpdateYtdlp();
         void cancel (int jobId);
         void dismiss (int jobId);
-        void clearFinished();
+
+        /** Vacía la lista (historial + errores). Los WAV quedan en la carpeta. */
+        void clearList();
+        void forget (const juce::File&);
 
         std::vector<Job> getJobs() const;
+        std::vector<HistoryItem> getHistory() const;
         ToolStatus getToolStatus() const;
         juce::uint32 getRevision() const noexcept { return revision.load(); }
 
@@ -97,11 +115,16 @@ namespace grab
         void fail (int jobId, const juce::String& message);
         void setTools (const std::function<void (ToolStatus&)>& fn);
 
-        static juce::String friendlyError (const juce::String& raw, bool wasSearch);
+        static juce::String friendlyError (const juce::String& raw);
+
+        static juce::File historyFile();
+        void loadHistory();
+        void saveHistory();   // llamar con lock tomado
 
         mutable juce::CriticalSection lock;
         std::deque<std::function<void()>> tasks;
         std::vector<Job> jobs;
+        std::vector<HistoryItem> history;
         std::vector<int> cancelled;
         ToolStatus tools;
         int nextJobId = 1;

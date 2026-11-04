@@ -1,0 +1,25 @@
+name: Compilar para Windows
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar
+        run: cmake -B build -A x64
+
+      - name: Compilar VST3 + app suelta
+        run: cmake --build build --config Release --target ClaraboyaGrab_VST3 ClaraboyaGrab_Standalone
+
+      - name: Subir el resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaraboyaGrab-Windows
+          path: |
+            build/ClaraboyaGrab_artefacts/Release/VST3/
+            build/ClaraboyaGrab_artefacts/Release/Standalone/*.exe

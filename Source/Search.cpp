@@ -195,7 +195,7 @@ namespace
         if (album.isEmpty() && c.extra == c.artist)
             c.extra = {};
 
-        c.thumbUrl = bestThumb (path (r, { "thumbnail", "musicThumbnailRenderer", "thumbnail", "thumbnails" }), 60);
+        c.thumbUrl = bestThumb (path (r, { "thumbnail", "musicThumbnailRenderer", "thumbnail", "thumbnails" }), 120);
         return c;
     }
 
@@ -394,7 +394,8 @@ void rankCandidates (std::vector<Candidate>& items, const TrackQuery& expected)
                 versionPenalty = 1.0f;
 
         c.score = 3.0f * titleSim + 2.0f * artistSim + 1.5f * durSim - versionPenalty - 0.04f * (float) i;
-        c.durationMatch = delta >= 0.0 && delta <= 2.5 && titleSim >= 0.5f;
+        // La marca va solo si además es el mismo tema del mismo artista (no un cover que dura igual).
+        c.durationMatch = delta >= 0.0 && delta <= 2.5 && titleSim >= 0.5f && (eA.isEmpty() || artistSim >= 0.5f);
     }
 
     std::stable_sort (items.begin(), items.end(), [] (const Candidate& a, const Candidate& b) { return a.score > b.score; });

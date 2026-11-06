@@ -9,6 +9,7 @@
 
 #include "Resolver.h"
 #include "Search.h"
+#include "Preview.h"
 #include "GrabEngine.h"
 #include "Tools.h"
 
@@ -285,6 +286,147 @@ static void pipelineTest()
 }
 
 //==============================================================================
+static float rms (const juce::AudioBuffer<float>& b)
+{
+    return b.getRMSLevel (0, 0, b.getNumSamples());
+}
+
+static bool waitForPreview (PreviewPlayer& pp, int timeoutMs)
+{
+    for (int i = 0; i < timeoutMs / 50; ++i)
+    {
+        const auto st = pp.getStatus().state;
+        if (st == PreviewPlayer::State::playing || st == PreviewPlayer::State::failed)
+            return true;
+        juce::Thread::sleep (50);
+    }
+    return false;
+}
+
+static void previewTest()
+{
+    std::cout << "\n== Preview (archivo local, sin internet)\n";
+    check (PreviewPlayer::chooseStart (294.0) == 88.0, "tema de 4:54: arranca en 1:28 (30 %)");
+    check (PreviewPlayer::chooseStart (40.0) == 0.0, "tema corto: desde el principio");
+    check (PreviewPlayer::chooseStart (0.0) == 0.0, "sin duración: desde el principio");
+    check (PreviewPlayer::chooseStart (50.0) == 15.0, "tema de 50 s: arranca en 0:15");
+
+    if (! Tools::allInstalled())
+    {
+        std::cout << "(salteada: faltan yt-dlp/ffmpeg)\n";
+        return;
+    }
+
+    auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                   .getChildFile ("grabpreview_" + juce::String (juce::Random::getSystemRandom().nextInt (999999)));
+    tmp.createDirectory();
+    auto tone = tmp.getChildFile (TR ("tono largo ñ.mp3"));
+    run ({ Tools::ffmpeg().getFullPathName(), "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=330:duration=60",
+           "-ar", "44100", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "128k", tone.getFullPathName() });
+
+    PreviewPlayer::cacheFolder().deleteRecursively();
+
+    Engine e;
+    e.setExtraYtdlpArgs ({ "--enable-file-urls" });
+    PreviewPlayer pp (e);
+    pp.setPlaybackRate (48000.0);
+
+    const auto url = "file://" + juce::URL::addEscapeChars (tone.getFullPathName(), false, true).replace ("%2F", "/");
+    auto t0 = juce::Time::getMillisecondCounter();
+    pp.play ("tono-prueba", url, "Tono de prueba", 60.0);
+    check (pp.getStatus().state == PreviewPlayer::State::loading, "arranca cargando");
+    check (waitForPreview (pp, 60000), "carga a tiempo");
+
+    auto st = pp.getStatus();
+    std::cout << "      tardó " << (int) (juce::Time::getMillisecondCounter() - t0) << " ms"
+              << (st.error.isNotEmpty() ? "  error: " + st.error : juce::String()) << "\n";
+    check (st.state == PreviewPlayer::State::playing, "suena", st.error);
+    check (st.startSec == 18.0 && st.lengthSec == 30.0, "fragmento de 30 s desde el 30 %");
+
+    juce::AudioBuffer<float> buf (2, 48000);
+    buf.clear();
+    pp.render (buf, 0, 48000);
+    std::cout << "      nivel RMS: " << rms (buf) << ", progreso tras 1 s: " << pp.getStatus().progress << "\n";
+    check (rms (buf) > 0.03f, "se escucha (suma audio al buffer)");
+    check (std::abs (pp.getStatus().progress - 1.0f / 30.0f) < 0.005f, "dura 30 s (avanza 1/30 por segundo)");
+    check (! pp.getStatus().stalled, "no se marca como trabado mientras suena");
+
+    // Otra frecuencia de reproducción: se adapta sin cambiar de tono
+    pp.setPlaybackRate (96000.0);
+    const auto before = pp.getStatus().progress;
+    juce::AudioBuffer<float> b96 (2, 96000);
+    b96.clear();
+    pp.render (b96, 0, 96000);
+    check (std::abs ((pp.getStatus().progress - before) - 1.0f / 30.0f) < 0.005f, "a 96 kHz también avanza 1 s por segundo");
+    pp.setPlaybackRate (48000.0);
+
+    juce::Thread::sleep (1700);
+    check (pp.getStatus().stalled, "si nadie lo reproduce, avisa que no llega sonido");
+
+    pp.stop();
+    buf.clear();
+    pp.render (buf, 0, 4800);
+    check (rms (buf) == 0.0f && pp.getStatus().state == PreviewPlayer::State::idle, "parar = silencio");
+
+    t0 = juce::Time::getMillisecondCounter();
+    pp.play ("tono-prueba", url, "Tono de prueba", 60.0);
+    waitForPreview (pp, 20000);
+    const auto cachedMs = juce::Time::getMillisecondCounter() - t0;
+    check (pp.getStatus().state == PreviewPlayer::State::playing && cachedMs < 3000,
+           "la segunda vez sale de la memoria (" + juce::String ((int) cachedMs) + " ms)");
+
+    // Hasta el final: se apaga solo
+    juce::AudioBuffer<float> chunk (2, 4800);
+    for (int i = 0; i < 400 && pp.getStatus().state == PreviewPlayer::State::playing; ++i)
+    {
+        chunk.clear();
+        pp.render (chunk, 0, chunk.getNumSamples());
+    }
+    check (pp.getStatus().state == PreviewPlayer::State::idle, "al terminar el fragmento se apaga solo");
+
+    // Por HTTP (como YouTube): baja solo el fragmento, no el archivo entero
+    {
+        juce::ChildProcess server;
+        const int port = 18000 + juce::Random::getSystemRandom().nextInt (2000);
+        server.start (juce::StringArray { "python3", "-m", "http.server", juce::String (port), "--bind", "127.0.0.1",
+                                          "--directory", tmp.getFullPathName() });
+        juce::Thread::sleep (1200);
+
+        auto big = tmp.getChildFile ("largo.mp3");
+        run ({ Tools::ffmpeg().getFullPathName(), "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=220:duration=300",
+               "-ar", "44100", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "128k", big.getFullPathName() });
+
+        pp.play ("http-largo", "http://127.0.0.1:" + juce::String (port) + "/largo.mp3", "Largo", 300.0);
+        waitForPreview (pp, 60000);
+        st = pp.getStatus();
+        check (st.state == PreviewPlayer::State::playing, "por HTTP baja solo el fragmento y suena", st.error);
+        check (st.startSec == 90.0, "tema de 5:00: arranca en 1:30");
+        buf.clear();
+        pp.render (buf, 0, 48000);
+        check (rms (buf) > 0.03f && std::abs (pp.getStatus().progress - 1.0f / 30.0f) < 0.005f, "fragmento de 30 s con audio");
+        pp.stop();
+        server.kill();
+    }
+
+    // Uno que no existe
+    pp.play ("roto", "file:///no/existe.mp3", "Roto", 100.0);
+    waitForPreview (pp, 30000);
+    st = pp.getStatus();
+    check (st.state == PreviewPlayer::State::failed && st.error.isNotEmpty(), "un link roto avisa el error", st.error);
+    std::cout << "      mensaje: " << st.error << "\n";
+
+    // Cambiar de opción mientras carga: gana la última
+    pp.play ("roto2", "file:///no/existe2.mp3", "Roto 2", 100.0);
+    pp.play ("tono-prueba", url, "Tono de prueba", 60.0);
+    waitForPreview (pp, 20000);
+    check (pp.getStatus().videoId == "tono-prueba" && pp.getStatus().state == PreviewPlayer::State::playing,
+           "si cambiás de opción rápido, suena la última");
+    pp.stop();
+
+    tmp.deleteRecursively();
+}
+
+//==============================================================================
 static void liveTests()
 {
     std::cout << "\n========== EN VIVO (internet real) ==========\n";
@@ -409,6 +551,21 @@ static void liveTests()
         std::cout << "      (sin yt-dlp)\n";
     }
 
+    std::cout << "\n== Preview real (informativo: YouTube suele bloquear a los servidores de GitHub)\n";
+    if (! songs.empty() && Tools::allInstalled())
+    {
+        Engine e;
+        PreviewPlayer pp (e);
+        pp.setPlaybackRate (48000.0);
+        const auto t0 = juce::Time::getMillisecondCounter();
+        pp.play (songs[0].videoId, songs[0].url(), songs[0].niceName(), songs[0].duration);
+        waitForPreview (pp, 120000);
+        const auto st = pp.getStatus();
+        std::cout << "      " << (st.state == PreviewPlayer::State::playing ? "sonó" : "no sonó: " + st.error)
+                  << " (" << (int) (juce::Time::getMillisecondCounter() - t0) << " ms)\n";
+        pp.stop();
+    }
+
     std::cout << "\n== Descarga real del elegido (informativo: YouTube suele bloquear a los servidores de GitHub)\n";
     if (! songs.empty() && Tools::allInstalled())
     {
@@ -437,6 +594,7 @@ int main (int argc, char** argv)
 
     offlineTests();
     pipelineTest();
+    previewTest();
 
     const int offlineFailures = failures;
 

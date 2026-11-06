@@ -48,6 +48,11 @@ public:
     void pick (int index);
     juce::Image getThumb (const juce::String& url)        { return processorRef.thumbs.get (url); }
 
+    // Preview (escuchar 30 s antes de bajar)
+    void togglePreview (int index);
+    const grab::PreviewPlayer::Status& getPreviewStatus() const { return previewStatus; }
+    bool previewGoesThroughHost() const                   { return engine.followsHostRate(); }
+
     const BrandFonts& getFonts() const { return *fonts; }
     grab::Engine& getEngine()          { return engine; }
 
@@ -110,6 +115,8 @@ private:
     juce::StringArray pending;
     int pendingTotal = 0, pendingIndex = 0;
     int highlighted = -1;
+    grab::PreviewPlayer::Status previewStatus;
+    juce::uint32 lastPreviewRevision = 0;
     juce::uint32 searchDue = 0, lastSearchRevision = 0, lastThumbRevision = 0;
     juce::String lastLinkRequested;
     bool suppressTyping = false;

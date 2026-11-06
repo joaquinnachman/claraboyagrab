@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include <algorithm>
 #include "Resolver.h"
 #include "Tools.h"
 
@@ -351,7 +352,35 @@ public:
         juce::String help;
         bool warn = false;
 
-        switch (r.state)
+        using PS = grab::PreviewPlayer::State;
+        const auto& ps = owner.getPreviewStatus();
+        const bool previewHere = ps.state != PS::idle
+                              && std::any_of (r.items.begin(), r.items.end(), [&] (const grab::Candidate& c) { return c.videoId == ps.videoId; });
+
+        if (previewHere && ps.state == PS::loading)
+        {
+            help = TR ("Cargando 30 s de «") + ps.title + TR ("»…");
+        }
+        else if (previewHere && ps.state == PS::playing && ps.stalled)
+        {
+            help = owner.previewGoesThroughHost()
+                 ? TR ("No llega sonido: Cubase no está procesando este canal. Probá en un canal activo o con la app suelta.")
+                 : TR ("No llega sonido a la salida de audio de Windows.");
+            warn = true;
+        }
+        else if (previewHere && ps.state == PS::playing)
+        {
+            help = TR ("Escuchando «") + ps.title + "»"
+                 + (ps.startSec >= 1.0 ? TR (" desde ") + grab::formatDuration (ps.startSec) : juce::String())
+                 + (owner.previewGoesThroughHost() ? TR (" · suena por este canal") : juce::String())
+                 + TR (" · tocá la tapa para parar");
+        }
+        else if (previewHere && ps.state == PS::failed)
+        {
+            help = TR ("No pude cargar el preview: ") + ps.error;
+            warn = true;
+        }
+        else switch (r.state)
         {
             case State::resolving: help = TR ("Leyendo título, artista y duración del link…"); break;
             case State::searching: help = TR ("Buscando en YouTube Music…"); break;
@@ -359,8 +388,8 @@ public:
             case State::done:
                 if (r.items.empty())       { help = TR ("No encontré nada. Probá con otras palabras o en VIDEOS."); warn = true; }
                 else if (r.usedFallback)   { help = TR ("YouTube Music no respondió: son resultados de YouTube. Elegí cuál bajar."); warn = true; }
-                else if (r.hasSource())    help = TR ("Elegí cuál bajar. «MISMA DURACIÓN» = dura igual que el original.");
-                else                       help = TR ("Elegí cuál bajar: clic en la opción (o flechas y Enter).");
+                else if (r.hasSource())    help = TR ("Tocá la tapa para escuchar 30 s · clic en la fila para bajar · «MISMA DURACIÓN» = igual al original");
+                else                       help = TR ("Tocá la tapa para escuchar 30 s · clic en la fila (o flechas y Enter) para bajar");
                 break;
             case State::idle:
             default: break;
@@ -479,6 +508,62 @@ public:
                 g.fillRect (thumb.reduced (15.0f, 13.0f).withWidth (5.0f).translated (2.0f, 0.0f));
                 g.fillEllipse (thumb.getCentreX() - 9.0f, thumb.getCentreY() + 2.0f, 9.0f, 7.0f);
             }
+
+            // Preview: ▶ al pasar por la tapa, ■ mientras suena, ruedita mientras carga
+            using PS = grab::PreviewPlayer::State;
+            const auto& ps = owner.getPreviewStatus();
+            const bool isThis = ps.videoId == c.videoId && (ps.state == PS::loading || ps.state == PS::playing);
+
+            if (overThumb || isThis)
+            {
+                g.setColour (juce::Colours::black.withAlpha (overThumb ? 0.6f : 0.5f));
+                g.fillRect (thumb);
+
+                const auto cx = thumb.getCentreX(), cy = thumb.getCentreY();
+                g.setColour (brand::white);
+
+                if (isThis && ps.state == PS::loading)
+                {
+                    const auto a = (float) (juce::Time::getMillisecondCounter() % 1000) / 1000.0f * juce::MathConstants<float>::twoPi;
+                    juce::Path arc;
+                    arc.addCentredArc (cx, cy, 10.0f, 10.0f, 0.0f, a, a + 4.3f, true);
+                    g.strokePath (arc, juce::PathStrokeType (2.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                }
+                else if (isThis)
+                {
+                    g.fillRoundedRectangle (juce::Rectangle<float> (12.0f, 12.0f).withCentre ({ cx, cy }), 2.0f);
+                }
+                else
+                {
+                    juce::Path tri;
+                    tri.addTriangle (cx - 5.0f, cy - 8.0f, cx - 5.0f, cy + 8.0f, cx + 9.0f, cy);
+                    g.fillPath (tri);
+                }
+            }
+            else
+            {
+                // Pista de que la tapa se puede escuchar: ▶ chiquito en la esquina
+                const auto bx = thumb.getRight() - 10.0f, by = thumb.getBottom() - 10.0f;
+                g.setColour (juce::Colours::black.withAlpha (0.65f));
+                g.fillEllipse (bx - 8.0f, by - 8.0f, 16.0f, 16.0f);
+                juce::Path tri;
+                tri.addTriangle (bx - 2.5f, by - 4.0f, bx - 2.5f, by + 4.0f, bx + 4.5f, by);
+                g.setColour (brand::white);
+                g.fillPath (tri);
+            }
+        }
+
+        // Barra del preview a lo largo de la fila
+        {
+            const auto& ps = owner.getPreviewStatus();
+            if (ps.videoId == c.videoId && ps.state == grab::PreviewPlayer::State::playing)
+            {
+                auto bar = r.toFloat().reduced (6.0f, 0.0f).removeFromBottom (3.0f);
+                g.setColour (brand::line);
+                g.fillRoundedRectangle (bar, 1.5f);
+                g.setColour (ps.stalled ? brand::yellow : brand::red);
+                g.fillRoundedRectangle (bar.withWidth (juce::jmax (3.0f, bar.getWidth() * ps.progress)), 1.5f);
+            }
         }
 
         // Derecha: duración + BAJAR
@@ -488,7 +573,8 @@ public:
         if (hot)
         {
             auto pill = right.removeFromRight (70).withSizeKeepingCentre (70, 28).toFloat();
-            drawPill (g, pill, brand::bordo.brighter (hover ? 0.25f : 0.1f), brand::white, f.title (17.0f, 0.06f), "BAJAR");
+            drawPill (g, pill, brand::bordo.brighter (hover && ! overThumb ? 0.25f : 0.0f),
+                      brand::white.withAlpha (overThumb ? 0.6f : 1.0f), f.title (17.0f, 0.06f), "BAJAR");
             right.removeFromRight (6);
         }
 
@@ -522,19 +608,34 @@ public:
         g.drawFittedText (sub, line2.withHeight (16), juce::Justification::centredLeft, 1, 0.85f);
     }
 
-    void mouseEnter (const juce::MouseEvent&) override { hover = true; repaint(); }
-    void mouseExit  (const juce::MouseEvent&) override { hover = false; repaint(); }
+    void mouseEnter (const juce::MouseEvent& e) override { hover = true; mouseMove (e); repaint(); }
+    void mouseExit  (const juce::MouseEvent&) override  { hover = overThumb = false; repaint(); }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const bool over = e.x < 8 + 46 + 8;   // la tapa y un poquito alrededor
+        if (over != overThumb)
+        {
+            overThumb = over;
+            repaint();
+        }
+    }
 
     void mouseUp (const juce::MouseEvent& e) override
     {
-        if (e.mouseWasClicked() && ! e.mods.isPopupMenu())
+        if (! e.mouseWasClicked() || e.mods.isPopupMenu())
+            return;
+
+        if (e.x < 8 + 46 + 8)
+            owner.togglePreview (row);
+        else
             owner.pick (row);
     }
 
 private:
     GrabEditor& owner;
     int row = -1;
-    bool hover = false;
+    bool hover = false, overThumb = false;
 };
 
 juce::Component* GrabEditor::ResultsPanel::refreshComponentForRow (int row, bool, juce::Component* existing)
@@ -638,6 +739,7 @@ GrabEditor::GrabEditor (GrabProcessor& p)
 GrabEditor::~GrabEditor()
 {
     stopTimer();
+    processorRef.preview.stop();
     input.removeKeyListener (this);
     list.setModel (nullptr);
     results.reset();
@@ -986,6 +1088,33 @@ bool GrabEditor::keyPressed (const juce::KeyPress& key, juce::Component*)
     return false;
 }
 
+void GrabEditor::togglePreview (int index)
+{
+    if (! juce::isPositiveAndBelow (index, (int) searchResult.items.size()))
+        return;
+
+    const auto& c = searchResult.items[(size_t) index];
+    const auto st = processorRef.preview.getStatus();
+    using PS = grab::PreviewPlayer::State;
+
+    if (st.videoId == c.videoId && (st.state == PS::loading || st.state == PS::playing))
+    {
+        processorRef.preview.stop();
+    }
+    else if (! engine.getToolStatus().installed)
+    {
+        toast (TR ("Primero tocá INSTALAR (es una sola vez)."), true);
+    }
+    else
+    {
+        processorRef.preview.play (c.videoId, c.url(), c.niceName(), c.duration);
+        highlighted = index;
+    }
+
+    previewStatus = processorRef.preview.getStatus();
+    results->repaint();
+}
+
 void GrabEditor::pick (int index)
 {
     if (! juce::isPositiveAndBelow (index, (int) searchResult.items.size()))
@@ -998,6 +1127,7 @@ void GrabEditor::pick (int index)
     }
 
     const auto c = searchResult.items[(size_t) index];
+    processorRef.preview.stop();
     engine.enqueueDownload (c.url(), c.title, c.artist);
     toast (TR ("Bajando: ") + c.niceName());
     advanceAfterPick();
@@ -1029,6 +1159,7 @@ void GrabEditor::openNextPending()
 
 void GrabEditor::closeResults()
 {
+    processorRef.preview.stop();
     pending.clear();
     pendingTotal = pendingIndex = 0;
     searchDue = 0;
@@ -1310,6 +1441,31 @@ void GrabEditor::timerCallback()
             highlighted = -1;
 
         results->refresh();
+    }
+
+    // Preview: estado, progreso, y cortarlo si su opción ya no está en la lista
+    {
+        using PS = grab::PreviewPlayer::State;
+        const auto rev = processorRef.preview.getRevision();
+        const bool active = previewStatus.state == PS::loading || previewStatus.state == PS::playing;
+
+        if (rev != lastPreviewRevision || active)
+        {
+            lastPreviewRevision = rev;
+            previewStatus = processorRef.preview.getStatus();
+            const bool nowActive = previewStatus.state == PS::loading || previewStatus.state == PS::playing;
+
+            if (nowActive && (! resultsVisible()
+                              || std::none_of (searchResult.items.begin(), searchResult.items.end(),
+                                               [this] (const grab::Candidate& c) { return c.videoId == previewStatus.videoId; })))
+            {
+                processorRef.preview.stop();
+                previewStatus = processorRef.preview.getStatus();
+            }
+
+            if (resultsVisible())
+                results->repaint();   // fila, barra y línea de ayuda
+        }
     }
 
     if (const auto rev = processorRef.thumbs.getRevision(); rev != lastThumbRevision)

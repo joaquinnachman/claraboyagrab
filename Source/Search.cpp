@@ -399,7 +399,7 @@ void rankCandidates (std::vector<Candidate>& items, const TrackQuery& expected)
 
         c.score = 3.0f * titleSim + 2.0f * artistSim + 1.5f * durSim - versionPenalty - 0.04f * (float) i;
         // La marca va solo si además es el mismo tema del mismo artista (no un cover que dura igual).
-        c.durationMatch = delta >= 0.0 && delta <= 2.5 && titleSim >= 0.5f && versionPenalty == 0.0f
+        c.durationMatch = delta >= 0.0 && delta <= 2.5 && titleSim >= 0.5f && versionPenalty <= 0.0f
                        && (eA.isEmpty() || artistSim >= 0.5f);
     }
 

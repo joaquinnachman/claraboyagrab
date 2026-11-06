@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(ClaraboyaGrab VERSION 1.1.0 LANGUAGES C CXX)
+project(ClaraboyaGrab VERSION 1.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,6 +31,7 @@ juce_add_binary_data(ClaraboyaGrabData
 set(GRAB_ENGINE_SOURCES
     Source/Resolver.cpp
     Source/Search.cpp
+    Source/Preview.cpp
     Source/Tools.cpp
     Source/GrabEngine.cpp)
 

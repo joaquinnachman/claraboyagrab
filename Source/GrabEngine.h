@@ -89,6 +89,11 @@ namespace grab
         ToolStatus getToolStatus() const;
         juce::uint32 getRevision() const noexcept { return revision.load(); }
 
+        /** Error de yt-dlp en castellano y sin tecnicismos. */
+        static juce::String friendlyError (const juce::String& raw);
+
+        juce::StringArray getExtraYtdlpArgs() const;
+
         // Para el programa de pruebas.
         void setExtraYtdlpArgs (const juce::StringArray&);
         bool waitUntilIdle (int timeoutMs);
@@ -115,7 +120,6 @@ namespace grab
         void fail (int jobId, const juce::String& message);
         void setTools (const std::function<void (ToolStatus&)>& fn);
 
-        static juce::String friendlyError (const juce::String& raw);
 
         static juce::File historyFile();
         void loadHistory();

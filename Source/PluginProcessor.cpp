@@ -20,9 +20,12 @@ bool GrabProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 
 void GrabProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
-    // Pasa el audio sin tocarlo.
+    // Pasa el audio sin tocarlo…
     for (auto ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
         buffer.clear (ch, 0, buffer.getNumSamples());
+
+    // …y le suma el preview si hay uno sonando.
+    preview.render (buffer, 0, buffer.getNumSamples());
 }
 
 juce::AudioProcessorEditor* GrabProcessor::createEditor()

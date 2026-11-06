@@ -229,6 +229,12 @@ void Engine::setUseFirefoxCookies (bool b)
     bump();
 }
 
+juce::StringArray Engine::getExtraYtdlpArgs() const
+{
+    const juce::ScopedLock sl (settingsLock);
+    return extraArgs;
+}
+
 void Engine::setExtraYtdlpArgs (const juce::StringArray& a)
 {
     const juce::ScopedLock sl (settingsLock);
@@ -487,6 +493,9 @@ int Engine::runProcess (const juce::StringArray& args, int jobId, const std::fun
         line.clear();
     };
 
+    int exitCode = 0;
+    bool finished = false;
+
     for (;;)
     {
         if (threadShouldExit() || isCancelled (jobId))
@@ -500,7 +509,11 @@ int Engine::runProcess (const juce::StringArray& args, int jobId, const std::fun
         if (n <= 0)
         {
             if (! proc.isRunning())
+            {
+                exitCode = (int) proc.getExitCode();
+                finished = true;
                 break;
+            }
 
             juce::Thread::sleep (15);
             continue;
@@ -522,8 +535,14 @@ int Engine::runProcess (const juce::StringArray& args, int jobId, const std::fun
         currentProcJob = 0;
     }
 
-    proc.waitForProcessToFinish (5000);
-    return (int) proc.getExitCode();
+    // El código de salida se toma apenas termina: en Linux/Mac, volver a preguntar lo pisa con 0.
+    if (! finished)
+    {
+        proc.waitForProcessToFinish (5000);
+        exitCode = (int) proc.getExitCode();
+    }
+
+    return exitCode;
 }
 
 //==============================================================================

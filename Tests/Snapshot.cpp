@@ -109,6 +109,25 @@ int main (int argc, char** argv)
         editor->showResultsForTesting (r, 1, 2, 0);
         pump (600);
         save (*ed, outDir.getChildFile ("2-opciones-spotify.png"));
+
+        // Escuchando la primera opción
+        grab::PreviewPlayer::Status ps;
+        ps.videoId = "a";
+        ps.title = "Banda de Ejemplo - Tema de Prueba";
+        ps.state = grab::PreviewPlayer::State::playing;
+        ps.progress = 0.38f;
+        ps.startSec = 88.0;
+        ps.lengthSec = 30.0;
+        p.preview.setStatusForTesting (ps);
+        pump (600);
+        save (*ed, outDir.getChildFile ("4-escuchando.png"));
+
+        ps.videoId = "c";
+        ps.title = "Banda de Ejemplo - Tema de Prueba (En Vivo)";
+        ps.state = grab::PreviewPlayer::State::loading;
+        p.preview.setStatusForTesting (ps);
+        pump (400);
+        save (*ed, outDir.getChildFile ("5-cargando-preview.png"));
     }
 
     // 3) Buscando, y la app sin herramientas

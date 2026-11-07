@@ -36,7 +36,7 @@ jobs:
           $v = (Select-String -Path CMakeLists.txt -Pattern 'project\(ClaraboyaGrab VERSION ([0-9.]+)').Matches[0].Groups[1].Value
           "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           New-Item -ItemType Directory -Force -Path paquete | Out-Null
-          Copy-Item -Recurse "build/ClaraboyaGrab_artefacts/Release/VST3/*" paquete/
+          Copy-Item -Recurse "build/ClaraboyaGrab_artefacts/Release/VST3/*.vst3" paquete/
           Copy-Item "build/ClaraboyaGrab_artefacts/Release/Standalone/*.exe" paquete/
           @"
           Claraboya Grab $v (Windows)

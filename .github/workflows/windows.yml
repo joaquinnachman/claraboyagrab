@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -23,3 +26,44 @@ jobs:
           path: |
             build/ClaraboyaGrab_artefacts/Release/VST3/
             build/ClaraboyaGrab_artefacts/Release/Standalone/*.exe
+
+      # Solo desde main: la versión queda publicada como Release y la web/app de Claraboya la ofrece
+      # (la toman los lunes, junto con todo lo demás).
+      - name: Armar el .zip para descargar
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path CMakeLists.txt -Pattern 'project\(ClaraboyaGrab VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          New-Item -ItemType Directory -Force -Path paquete | Out-Null
+          Copy-Item -Recurse "build/ClaraboyaGrab_artefacts/Release/VST3/*" paquete/
+          Copy-Item "build/ClaraboyaGrab_artefacts/Release/Standalone/*.exe" paquete/
+          @"
+          Claraboya Grab $v (Windows)
+
+          PLUGIN PARA CUBASE
+          1. Copiá la carpeta "Claraboya Grab.vst3" a C:\Program Files\Common Files\VST3
+          2. En Cubase: Studio > VST Plug-in Manager > actualizar. Aparece en Tools > Claraboya Grab.
+          3. La primera vez tocá INSTALAR (baja yt-dlp, FFmpeg y Deno, unos 200 MB, una sola vez).
+
+          PROGRAMA SUELTO
+          "Claraboya Grab.exe" es la misma herramienta sin Cubase: abrilo con doble clic.
+
+          Pensado para escuchar referencias en el estudio, no para usar ese audio en una producción.
+          Bajar de YouTube y otras plataformas va contra sus términos de uso.
+
+          Claraboya Estudio · claraboyaestudio.netlify.app
+          "@ | Out-File -FilePath paquete/LEEME.txt -Encoding utf8
+          Compress-Archive -Path paquete/* -DestinationPath ClaraboyaGrab-Windows.zip -Force
+          Get-Item ClaraboyaGrab-Windows.zip | Select-Object Name, Length
+
+      - name: Publicar en Releases
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "build-${{ github.run_number }}" ClaraboyaGrab-Windows.zip --latest \
+            --target "${{ github.sha }}" \
+            --title "Claraboya Grab ${VERSION} · build ${{ github.run_number }}" \
+            --notes "Plugin VST3 para Cubase y programa suelto, para Windows. Instrucciones en LEEME.txt adentro del .zip."

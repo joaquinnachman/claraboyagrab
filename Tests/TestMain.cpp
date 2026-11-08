@@ -10,6 +10,8 @@
 #include "Resolver.h"
 #include "Search.h"
 #include "Preview.h"
+#include "Updater.h"
+#include <juce_cryptography/juce_cryptography.h>
 #include "GrabEngine.h"
 #include "Tools.h"
 
@@ -427,6 +429,84 @@ static void previewTest()
 }
 
 //==============================================================================
+static void updaterTest()
+{
+    std::cout << "\n== Aviso de versión nueva (sin internet)\n";
+
+    const char* fixture = R"J({
+      "tag_name": "build-12",
+      "name": "Claraboya Grab 1.3.0 · build 12",
+      "html_url": "https://github.com/joaquinnachman/claraboyagrab/releases/tag/build-12",
+      "body": "Plugin VST3 para Cubase y programa suelto, para Windows.
+
+Novedades:
+- Preview: escuchar 30 s de cada opción
+- Aviso de versión nueva
+",
+      "assets": [
+        { "name": "ClaraboyaGrab-Windows.zip", "size": 6960592,
+          "browser_download_url": "https://github.com/joaquinnachman/claraboyagrab/releases/download/build-12/ClaraboyaGrab-Windows.zip" },
+        { "name": "ClaraboyaGrab-Instalador.exe", "size": 7340032, "digest": "sha256:abc123",
+          "browser_download_url": "https://github.com/joaquinnachman/claraboyagrab/releases/download/build-12/ClaraboyaGrab-Instalador.exe" },
+        { "name": "Otro-Instalador.exe", "size": 1,
+          "browser_download_url": "https://ejemplo.com/Otro-Instalador.exe" }
+      ]})J";
+
+    Updater::Release r;
+    check (Updater::parseLatest (juce::JSON::parse (juce::String::fromUTF8 (fixture)), r), "lee la última Release");
+    check (r.build == 12, "build 12", juce::String (r.build));
+    eq (r.label, TR ("1.3.0 · build 12"), "etiqueta de versión");
+    check (r.changes.size() == 2, "2 novedades", juce::String (r.changes.size()));
+    eq (r.changes[0], TR ("Preview: escuchar 30 s de cada opción"), "primera novedad");
+    eq (r.installerUrl, "https://github.com/joaquinnachman/claraboyagrab/releases/download/build-12/ClaraboyaGrab-Instalador.exe",
+        "instalador de este repo (ignora links de otros sitios)");
+    check (r.installerSize == 7340032 && r.installerDigest == "sha256:abc123", "tamaño y SHA-256 del instalador");
+    check (r.zipUrl.endsWith ("ClaraboyaGrab-Windows.zip"), "también el .zip");
+
+    Updater::Release none;
+    check (! Updater::parseLatest (juce::JSON::parse ("{\"tag_name\": \"v1.0\"}"), none), "ignora tags que no son build-N");
+    check (Updater::currentBuild() == 0, "las pruebas son compilación de prueba (build 0)");
+
+    // Descarga local verificada (sin internet): con un servidor HTTP propio
+    auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                   .getChildFile ("grabupd_" + juce::String (juce::Random::getSystemRandom().nextInt (999999)));
+    tmp.createDirectory();
+    auto payload = tmp.getChildFile ("ClaraboyaGrab-Instalador.exe");
+    {
+        juce::MemoryBlock mb;
+        juce::Random rnd (42);
+        for (int i = 0; i < 300000; ++i) { const auto b = (char) rnd.nextInt (256); mb.append (&b, 1); }
+        payload.replaceWithData (mb.getData(), mb.getSize());
+    }
+    const auto digest = "sha256:" + juce::SHA256 (payload).toHexString();
+
+    juce::ChildProcess server;
+    const int port = 20000 + juce::Random::getSystemRandom().nextInt (2000);
+    server.start (juce::StringArray { "python3", "-m", "http.server", juce::String (port), "--bind", "127.0.0.1",
+                                      "--directory", tmp.getFullPathName() });
+    juce::Thread::sleep (1200);
+    const auto url = "http://127.0.0.1:" + juce::String (port) + "/ClaraboyaGrab-Instalador.exe";
+
+    juce::String err;
+    float lastProgress = 0.0f;
+    auto dest = tmp.getChildFile ("bajado.exe");
+    check (Updater::download (url, payload.getSize(), digest, dest, [&] (float p) { lastProgress = p; }, nullptr, err),
+           "baja y verifica el SHA-256", err);
+    check (dest.getSize() == payload.getSize() && lastProgress > 0.99f, "completo, con progreso hasta el 100 %");
+
+    check (! Updater::download (url, payload.getSize(), "sha256:0000", tmp.getChildFile ("malo.exe"), nullptr, nullptr, err)
+           && ! tmp.getChildFile ("malo.exe").exists() && ! tmp.getChildFile ("malo.exe.part").exists(),
+           "si el SHA-256 no coincide, lo descarta", err);
+    std::cout << "      mensaje: " << err << "\n";
+
+    check (! Updater::download (url, payload.getSize() + 10, {}, tmp.getChildFile ("corto.exe"), nullptr, nullptr, err),
+           "si llega cortado, lo descarta", err);
+
+    server.kill();
+    tmp.deleteRecursively();
+}
+
+//==============================================================================
 static void liveTests()
 {
     std::cout << "\n========== EN VIVO (internet real) ==========\n";
@@ -551,6 +631,36 @@ static void liveTests()
         std::cout << "      (sin yt-dlp)\n";
     }
 
+    std::cout << "\n== Aviso de versión nueva: la Release real en GitHub\n";
+    {
+        int status = 0;
+        auto opts = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                        .withConnectionTimeoutMs (15000).withNumRedirectsToFollow (5).withStatusCode (&status)
+                        .withExtraHeaders ("Accept: application/vnd.github+json\r\nUser-Agent: ClaraboyaGrab-pruebas\r\n");
+        Updater::Release r;
+        bool ok = false;
+        if (auto in = juce::URL::createWithoutParsing (Updater::apiUrl).createInputStream (opts); in != nullptr && status == 200)
+            ok = Updater::parseLatest (juce::JSON::parse (in->readEntireStreamAsString()), r);
+
+        std::cout << "      HTTP " << status << " -> " << r.label << ", instalador: " << (r.installerUrl.isNotEmpty() ? "sí" : "no")
+                  << ", novedades: " << r.changes.size() << "\n";
+        for (auto& c : r.changes) std::cout << "        - " << c << "\n";
+        check (ok && r.build >= 9 && r.zipUrl.isNotEmpty(), "lee la última Release publicada");
+
+        // Descarga real con verificación (el instalador si ya existe; si no, el .zip)
+        const auto url = r.installerUrl.isNotEmpty() ? r.installerUrl : r.zipUrl;
+        const auto size = r.installerUrl.isNotEmpty() ? r.installerSize : (juce::int64) 0;
+        const auto dg = r.installerUrl.isNotEmpty() ? r.installerDigest : juce::String();
+        juce::String err;
+        auto dest = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("grab-update-test.bin");
+        const auto t0 = juce::Time::getMillisecondCounter();
+        check (Updater::download (url, size, dg, dest, nullptr, nullptr, err) && dest.getSize() > 1000000,
+               "baja desde GitHub (sigue las redirecciones)", err);
+        std::cout << "      " << dest.getSize() / 1024 << " KB en " << (int) (juce::Time::getMillisecondCounter() - t0) << " ms"
+                  << (dg.isNotEmpty() ? " (SHA-256 verificado)" : "") << "\n";
+        dest.deleteFile();
+    }
+
     std::cout << "\n== Preview real (informativo: YouTube suele bloquear a los servidores de GitHub)\n";
     if (! songs.empty() && Tools::allInstalled())
     {
@@ -595,6 +705,7 @@ int main (int argc, char** argv)
     offlineTests();
     pipelineTest();
     previewTest();
+    updaterTest();
 
     const int offlineFailures = failures;
 

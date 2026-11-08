@@ -146,5 +146,30 @@ int main (int argc, char** argv)
         save (*ed, outDir.getChildFile ("3-buscando.png"));
     }
 
+    // 6) Aviso de versión nueva
+    {
+        GrabProcessor p;
+        p.engine.setOutputFolder (outDir.getChildFile ("salida-lista"));
+        p.prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> ed (p.createEditor());
+
+        grab::Updater::Status u;
+        u.state = grab::Updater::State::available;
+        u.latest.build = 12;
+        u.latest.label = juce::String::fromUTF8 ("1.3.0 · build 12");
+        u.latest.changes = { "Preview: escuchar 30 s de cada opción antes de bajarla", "Aviso de versión nueva" };
+        u.latest.changes.set (0, juce::String::fromUTF8 ("Preview: escuchar 30 s de cada opción antes de bajarla"));
+        u.latest.changes.set (1, juce::String::fromUTF8 ("Aviso de versión nueva dentro de la app"));
+        p.updater->setStatusForTesting (u);
+        pump (800);
+        save (*ed, outDir.getChildFile ("6-aviso-version-nueva.png"));
+
+        u.state = grab::Updater::State::downloading;
+        u.progress = 0.42f;
+        p.updater->setStatusForTesting (u);
+        pump (500);
+        save (*ed, outDir.getChildFile ("7-bajando-instalador.png"));
+    }
+
     return 0;
 }

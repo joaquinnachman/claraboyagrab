@@ -1,3 +1,5 @@
 build/
+salida/
+paquete/
 .vs/
 *.user

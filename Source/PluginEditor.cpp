@@ -230,6 +230,102 @@ private:
 };
 
 //==============================================================================
+/** Aviso de versión nueva de Claraboya Grab. */
+class GrabEditor::UpdateBanner final : public juce::Component
+{
+public:
+    explicit UpdateBanner (GrabEditor& o) : owner (o)
+    {
+        updateButton.setButtonText ("ACTUALIZAR");
+        updateButton.getProperties().set ("primary", true);
+        updateButton.onClick = [this] { owner.getUpdater().install(); };
+        addAndMakeVisible (updateButton);
+
+        laterButton.setButtonText (TR ("MÁS TARDE"));
+        laterButton.onClick = [this] { owner.getUpdater().dismiss(); };
+        addAndMakeVisible (laterButton);
+    }
+
+    void setStatus (const grab::Updater::Status& s)
+    {
+        using U = grab::Updater::State;
+        status = s;
+        const bool busy = s.state == U::downloading || s.state == U::launching;
+        updateButton.setVisible (! busy);
+        updateButton.setButtonText (s.state == U::failed ? "REINTENTAR" : "ACTUALIZAR");
+        laterButton.setVisible (! busy);
+        resized();
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        using U = grab::Updater::State;
+        const auto& f = owner.getFonts();
+        auto r = getLocalBounds().toFloat();
+
+        g.setColour (juce::Colour (0xff2a1b1c));
+        g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (brand::red.withAlpha (0.8f));
+        g.fillRoundedRectangle (r.withWidth (4.0f), 2.0f);
+        g.setColour (brand::bordo.brighter (0.2f));
+        g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+
+        auto text = getLocalBounds().reduced (16, 10);
+        if (updateButton.isVisible())
+            text.removeFromRight (buttonsWidth + 14);
+
+        g.setColour (brand::white);
+        g.setFont (f.bold (14.0f));
+        g.drawFittedText (TR ("Hay una versión nueva: ") + status.latest.label, text.removeFromTop (20),
+                          juce::Justification::centredLeft, 1, 0.85f);
+
+        juce::String sub;
+        bool warn = false;
+
+        if (status.state == U::downloading)
+            sub = TR ("Bajando el instalador… ") + juce::String (juce::roundToInt (juce::jmax (0.0f, status.progress) * 100.0f)) + " %";
+        else if (status.state == U::launching)
+            sub = owner.previewGoesThroughHost()
+                ? TR ("Se abrió el instalador. Si te pide cerrar Cubase, guardá el proyecto antes.")
+                : TR ("Abriendo el instalador… la app se cierra para poder actualizarse.");
+        else if (status.state == U::failed)
+            { sub = status.error; warn = true; }
+        else if (! status.latest.changes.isEmpty())
+            sub = TR ("Novedades: ") + status.latest.changes.joinIntoString (TR ("  ·  "));
+        else
+            sub = TR ("Tocá ACTUALIZAR: se baja el instalador y se abre solo.");
+
+        g.setColour (warn ? brand::yellow : brand::grey);
+        g.setFont (f.semi (12.0f));
+        g.drawFittedText (sub, text.removeFromTop (32), juce::Justification::topLeft, 2, 0.9f);
+
+        if (status.state == U::downloading || status.state == U::launching)
+        {
+            auto bar = getLocalBounds().reduced (16, 0).removeFromBottom (10).withHeight (3).toFloat();
+            g.setColour (brand::line);
+            g.fillRoundedRectangle (bar, 1.5f);
+            g.setColour (brand::red);
+            g.fillRoundedRectangle (bar.withWidth (bar.getWidth() * juce::jlimit (0.0f, 1.0f, status.progress)), 1.5f);
+        }
+    }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (14, 10).removeFromRight (buttonsWidth);
+        updateButton.setBounds (r.removeFromTop (30));
+        r.removeFromTop (6);
+        laterButton.setBounds (r.removeFromTop (22).reduced (14, 0));
+    }
+
+private:
+    static constexpr int buttonsWidth = 130;
+    GrabEditor& owner;
+    juce::TextButton updateButton, laterButton;
+    grab::Updater::Status status;
+};
+
+//==============================================================================
 /** Panel de opciones del buscador: elegís cuál bajar. */
 class GrabEditor::ResultsPanel final : public juce::Component,
                                        private juce::ListBoxModel
@@ -711,6 +807,9 @@ GrabEditor::GrabEditor (GrabProcessor& p)
     banner = std::make_unique<ToolsBanner> (*this);
     addChildComponent (*banner);
 
+    versionBanner = std::make_unique<UpdateBanner> (*this);
+    addChildComponent (*versionBanner);
+
     results = std::make_unique<ResultsPanel> (*this);
     results->onClose = [this] { closeResults(); };
     results->onSkip  = [this] { advanceAfterPick(); };
@@ -840,6 +939,12 @@ void GrabEditor::resized()
     if (banner->isVisible())
     {
         banner->setBounds (r.removeFromTop (74));
+        r.removeFromTop (10);
+    }
+
+    if (versionBanner->isVisible())
+    {
+        versionBanner->setBounds (r.removeFromTop (74));
         r.removeFromTop (10);
     }
 
@@ -1250,8 +1355,16 @@ void GrabEditor::showSettings()
     juce::Component::SafePointer<GrabEditor> safe (this);
     juce::PopupMenu m;
 
-    m.addSectionHeader ("CLARABOYA GRAB " CLARABOYA_GRAB_VERSION
+    m.addSectionHeader ("CLARABOYA GRAB " + grab::Updater::currentLabel().toUpperCase()
                         + (st.version.isNotEmpty() ? "   yt-dlp " + st.version : juce::String()));
+    m.addItem (TR ("Buscar versión nueva de Claraboya Grab"), [safe]
+    {
+        if (safe == nullptr) return;
+        safe->awaitingUpdateCheck = true;
+        safe->getUpdater().checkNow();
+        safe->toast (TR ("Buscando versión nueva…"));
+    });
+    m.addSeparator();
     m.addItem (TR ("Cambiar carpeta de descarga…"), [safe] { if (safe != nullptr) safe->chooseFolder(); });
     m.addItem (TR ("Abrir carpeta"), [safe]
     {
@@ -1390,6 +1503,41 @@ void GrabEditor::rebuildItems()
         repaint();
 }
 
+void GrabEditor::updateUpdateBanner()
+{
+    using U = grab::Updater::State;
+    const auto st = getUpdater().getStatus();
+
+    // Resultado de "Buscar versión nueva" (a mano)
+    if (awaitingUpdateCheck && st.state != U::checking)
+    {
+        if (st.state == U::upToDate)
+        {
+            awaitingUpdateCheck = false;
+            toast (TR ("Tenés la última versión (") + grab::Updater::currentLabel() + ").");
+        }
+        else if (st.state == U::failed || st.state == U::available)
+        {
+            awaitingUpdateCheck = false;
+            if (st.state == U::failed)
+                toast (st.error, true);
+        }
+    }
+
+    const bool show = (st.state == U::available && ! st.dismissed)
+                   || st.state == U::downloading || st.state == U::launching
+                   || (st.state == U::failed && st.latest.build > grab::Updater::currentBuild() && ! st.dismissed);
+
+    versionBanner->setStatus (st);
+
+    if (show != versionBanner->isVisible())
+    {
+        versionBanner->setVisible (show);
+        resized();
+        repaint();
+    }
+}
+
 void GrabEditor::updateBanner()
 {
     const auto st = engine.getToolStatus();
@@ -1484,6 +1632,12 @@ void GrabEditor::timerCallback()
 
     if (engine.getOutputFolder() != lastFolder)
         updateFolderLabel();
+
+    if (const auto rev = getUpdater().getRevision(); rev != lastUpdaterRevision)
+    {
+        lastUpdaterRevision = rev;
+        updateUpdateBanner();
+    }
 
     if (const auto rev = engine.getRevision(); rev != lastRevision || now - lastRebuild > 3000)
     {

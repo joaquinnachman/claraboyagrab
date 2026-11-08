@@ -5,6 +5,7 @@
 #include "Search.h"
 #include "ThumbCache.h"
 #include "Preview.h"
+#include "Updater.h"
 #include <limits>
 
 /** No procesa audio: lo deja pasar tal cual. Es solo la "casa" del bajador dentro de Cubase. */
@@ -47,6 +48,7 @@ public:
     grab::Searcher searcher;
     ThumbCache thumbs;
     grab::PreviewPlayer preview { engine };
+    juce::SharedResourcePointer<grab::Updater> updater;   // uno solo aunque haya varias instancias
 
 private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GrabProcessor)

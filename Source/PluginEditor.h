@@ -55,6 +55,7 @@ public:
 
     const BrandFonts& getFonts() const { return *fonts; }
     grab::Engine& getEngine()          { return engine; }
+    grab::Updater& getUpdater()        { return *processorRef.updater; }
 
     /** Para capturas y pruebas. */
     void setInputTextForTesting (const juce::String& t) { setInputSilently (t); }
@@ -63,6 +64,7 @@ public:
 private:
     class Row;
     class ToolsBanner;
+    class UpdateBanner;
     class ResultsPanel;
 
     void timerCallback() override;
@@ -87,6 +89,7 @@ private:
     void chooseFolder();
     void rebuildItems();
     void updateBanner();
+    void updateUpdateBanner();
     void updateFolderLabel();
     void toast (const juce::String&, bool isError = false);
     juce::String fileInfo (const juce::File&);
@@ -101,6 +104,7 @@ private:
     juce::TextEditor input;
     juce::TextButton goButton, folderButton, settingsButton, clearButton;
     std::unique_ptr<ToolsBanner> banner;
+    std::unique_ptr<UpdateBanner> versionBanner;
     std::unique_ptr<ResultsPanel> results;
     juce::ListBox list;
 
@@ -123,7 +127,8 @@ private:
 
     juce::uint32 lastRevision = 0, lastRebuild = 0, toastUntil = 0;
     juce::String lastSignature, toastText;
-    bool toastError = false, toolsWereBusy = false;
+    bool toastError = false, toolsWereBusy = false, awaitingUpdateCheck = false;
+    juce::uint32 lastUpdaterRevision = 0;
     juce::File lastFolder;
     juce::Rectangle<int> headerArea, hintArea, listHeaderArea, footerInfoArea, footerArea;
 

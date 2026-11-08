@@ -12,27 +12,27 @@ No toca el audio del canal donde lo pongas: es solo la ventana del bajador.
 
 ---
 
-## 1. Conseguir el .vst3
+## 1. Instalarlo
+1. Bajá el instalador: **[ClaraboyaGrab-Instalador.exe](https://github.com/joaquinnachman/claraboyagrab/releases/latest/download/ClaraboyaGrab-Instalador.exe)** (siempre la última versión).
+2. Abrilo. Windows puede avisar que es de un editor desconocido: **Más información › Ejecutar de todas formas**. Pone el plugin en `C:\Program Files\Common Files\VST3` y el programa suelto en el menú Inicio.
+3. En Cubase: Studio › VST Plug-in Manager › actualizar. Aparece en **Tools › Claraboya Grab**. Cargalo como insert en cualquier canal.
+4. La primera vez tocá **INSTALAR**: baja yt-dlp, FFmpeg y Deno (unos 200 MB) a `%APPDATA%\Claraboya Grab\bin`. Es una sola vez.
 
-### Opción A: GitHub (no instalás nada)
-1. Creá un repositorio **privado** en github.com y subí esta carpeta entera (con la carpeta `.github`).
-2. Entrá a la pestaña **Actions**: arranca solo "Compilar para Windows" (unos 10 minutos).
-3. Cuando termina, abrí la ejecución y bajá **ClaraboyaGrab-Windows** (abajo de todo, "Artifacts").
+El programa suelto (**Claraboya Grab** en el menú Inicio) es la misma herramienta sin Cubase. Ahí la frecuencia del WAV se elige en **AJUSTES** (en Cubase sigue a la sesión).
 
-### Opción B: compilar en tu PC
-1. Abrí PowerShell y pegá:
-   ```
-   winget install Kitware.CMake Git.Git
-   winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-   ```
-2. Reiniciá la PC y hacé doble clic en `compilar.bat`. La primera vez tarda (baja JUCE).
+## 2. Actualizaciones
+Claraboya Grab se fija solo (al abrir y cada 6 horas) si hay una versión nueva. Si hay, aparece un aviso con las novedades: **ACTUALIZAR** baja el instalador, verifica que llegó entero y lo abre (en la app suelta, la app se cierra sola para poder actualizarse; en Cubase, el instalador te pide cerrar Cubase: guardá antes). **MÁS TARDE** lo esconde hasta la próxima vez que lo abras. También está **AJUSTES › Buscar versión nueva**.
 
-## 2. Instalarlo
-1. Copiá la carpeta **`Claraboya Grab.vst3`** a `C:\Program Files\Common Files\VST3`.
-2. En Cubase: Studio › VST Plug-in Manager › actualizar. Aparece en **Tools › Claraboya Grab**.
-3. Cargalo como insert en cualquier canal. La primera vez tocá **INSTALAR**: baja yt-dlp, FFmpeg y Deno (unos 200 MB) a `%APPDATA%\Claraboya Grab\bin`. Es una sola vez.
+Cada cambio que se sube a `main` se publica solo como Release (`build-N`) con el instalador y el `.zip`.
 
-También queda `Claraboya Grab.exe` (en la carpeta `Standalone`), la misma herramienta como programa suelto, con el ícono de Claraboya. Ahí la frecuencia del WAV se elige en **AJUSTES** (en Cubase sigue a la sesión).
+### Compilarlo vos (opcional)
+- **GitHub:** cada push compila en la pestaña **Actions** ("Compilar para Windows"); el resultado queda en "Artifacts".
+- **En tu PC:** abrí PowerShell y pegá
+  ```
+  winget install Kitware.CMake Git.Git
+  winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+  ```
+  Reiniciá la PC y hacé doble clic en `compilar.bat`. La primera vez tarda (baja JUCE). Las compilaciones propias son "de prueba" y no se actualizan solas.
 
 ## 3. Usarlo
 1. Copiá un link (o escribí artista y tema en el campo).
@@ -60,6 +60,8 @@ Bajar de estas plataformas va contra sus términos de uso: pensado para escuchar
 - `Source/Resolver.cpp`: qué tema es cada link (Spotify por su página "embed", Apple por iTunes, Deezer por su API).
 - `Source/Search.cpp`: buscador de YouTube Music con opciones (y respaldo con yt-dlp), orden por parecido y duración.
 - `Source/GrabEngine.cpp`: cola de descargas, historial, yt-dlp, FFmpeg, instalador.
+- `Source/Updater.cpp`: aviso de versión nueva (consulta la última Release `build-N` de GitHub, baja y verifica el instalador).
+- `installer/ClaraboyaGrab.iss`: instalador de Windows (Inno Setup), lo arma GitHub Actions.
 - `Source/Preview.cpp`: preview de 30 s (fragmento con `--download-sections`, nivelado con `loudnorm`, se reproduce sin trabar el hilo de audio).
 - `Source/PluginEditor.cpp`: interfaz. `Source/StandaloneApp.cpp`: ventana de la app suelta.
 - Pruebas: `cmake -B build -DCLARABOYA_BUILD_TESTS=ON` y correr `ClaraboyaGrabTests` (con `--live` prueba contra Spotify y YouTube Music de verdad; en GitHub corre solo en cada rama que no sea `main`).

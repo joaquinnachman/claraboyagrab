@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(ClaraboyaGrab VERSION 1.2.0 LANGUAGES C CXX)
+project(ClaraboyaGrab VERSION 1.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,7 +10,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(CLARABOYA_BUILD_TESTS "Compilar el programa de pruebas (solo desarrollo)" OFF)
 
-add_compile_definitions(CLARABOYA_GRAB_VERSION="${PROJECT_VERSION}")
+# Número de build: lo pone GitHub Actions (es el mismo de la Release "build-N"). 0 = compilación de prueba.
+set(CLARABOYA_GRAB_BUILD 0 CACHE STRING "Número de build (GitHub Actions)")
+add_compile_definitions(CLARABOYA_GRAB_VERSION="${PROJECT_VERSION}" CLARABOYA_GRAB_BUILD=${CLARABOYA_GRAB_BUILD})
 
 include(FetchContent)
 FetchContent_Declare(JUCE
@@ -32,6 +34,7 @@ set(GRAB_ENGINE_SOURCES
     Source/Resolver.cpp
     Source/Search.cpp
     Source/Preview.cpp
+    Source/Updater.cpp
     Source/Tools.cpp
     Source/GrabEngine.cpp)
 
@@ -74,6 +77,7 @@ target_link_libraries(ClaraboyaGrab
         ClaraboyaGrabData
         juce::juce_audio_utils
         juce::juce_audio_formats
+        juce::juce_cryptography
     PUBLIC
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
@@ -96,6 +100,7 @@ if(CLARABOYA_BUILD_TESTS)
         juce::juce_data_structures
         juce::juce_graphics
         juce::juce_audio_formats
+        juce::juce_cryptography
         juce::juce_recommended_config_flags)
 
     juce_add_console_app(ClaraboyaGrabSnapshot PRODUCT_NAME "ClaraboyaGrabSnapshot" NEEDS_CURL TRUE)
@@ -108,5 +113,6 @@ if(CLARABOYA_BUILD_TESTS)
         ClaraboyaGrabData
         juce::juce_audio_utils
         juce::juce_audio_formats
+        juce::juce_cryptography
         juce::juce_recommended_config_flags)
 endif()

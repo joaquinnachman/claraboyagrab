@@ -50,6 +50,7 @@ public:
 
     // Preview (escuchar 30 s antes de bajar)
     void togglePreview (int index);
+    void hoverThumb (int index, bool over);   // al pasar por la tapa se resuelve el link por adelantado
     const grab::PreviewPlayer::Status& getPreviewStatus() const { return previewStatus; }
     bool previewGoesThroughHost() const                   { return engine.followsHostRate(); }
 
@@ -121,6 +122,10 @@ private:
     int highlighted = -1;
     grab::PreviewPlayer::Status previewStatus;
     juce::uint32 lastPreviewRevision = 0;
+    int hoverRow = -1, prefetchedGeneration = 0;
+    juce::uint32 hoverSince = 0, resultsStableSince = 0;
+    juce::String lastPrefetchId;
+    void prefetchItem (int index);
     juce::uint32 searchDue = 0, lastSearchRevision = 0, lastThumbRevision = 0;
     juce::String lastLinkRequested;
     bool suppressTyping = false;

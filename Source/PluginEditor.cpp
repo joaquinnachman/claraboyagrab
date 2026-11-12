@@ -705,7 +705,13 @@ public:
     }
 
     void mouseEnter (const juce::MouseEvent& e) override { hover = true; mouseMove (e); repaint(); }
-    void mouseExit  (const juce::MouseEvent&) override  { hover = overThumb = false; repaint(); }
+    void mouseExit  (const juce::MouseEvent&) override
+    {
+        if (overThumb)
+            owner.hoverThumb (row, false);
+        hover = overThumb = false;
+        repaint();
+    }
 
     void mouseMove (const juce::MouseEvent& e) override
     {
@@ -713,6 +719,7 @@ public:
         if (over != overThumb)
         {
             overThumb = over;
+            owner.hoverThumb (row, over);
             repaint();
         }
     }
@@ -1220,6 +1227,33 @@ void GrabEditor::togglePreview (int index)
     results->repaint();
 }
 
+void GrabEditor::hoverThumb (int index, bool over)
+{
+    if (over)
+    {
+        hoverRow = index;
+        hoverSince = juce::Time::getMillisecondCounter();
+    }
+    else if (hoverRow == index)
+    {
+        hoverRow = -1;
+    }
+}
+
+void GrabEditor::prefetchItem (int index)
+{
+    if (! juce::isPositiveAndBelow (index, (int) searchResult.items.size()))
+        return;
+
+    const auto& c = searchResult.items[(size_t) index];
+
+    if (c.videoId != lastPrefetchId)
+    {
+        lastPrefetchId = c.videoId;
+        processorRef.preview.prefetch (c.videoId, c.url());
+    }
+}
+
 void GrabEditor::pick (int index)
 {
     if (! juce::isPositiveAndBelow (index, (int) searchResult.items.size()))
@@ -1588,7 +1622,28 @@ void GrabEditor::timerCallback()
         if (highlighted >= (int) searchResult.items.size())
             highlighted = -1;
 
+        resultsStableSince = 0;
         results->refresh();
+    }
+
+    // Preview más rápido: resolver por adelantado la opción bajo el mouse (a los 150 ms)
+    // y la primera de cada búsqueda (cuando los resultados quedan quietos 0,7 s).
+    if (resultsVisible() && searchResult.state == grab::Searcher::Result::State::done && ! searchResult.items.empty()
+        && engine.getToolStatus().installed)
+    {
+        if (hoverRow >= 0 && now - hoverSince > 150)
+            prefetchItem (hoverRow);
+
+        if (searchResult.generation != prefetchedGeneration)
+        {
+            if (resultsStableSince == 0)
+                resultsStableSince = juce::jmax ((juce::uint32) 1, now);
+            else if (now - resultsStableSince > 700)
+            {
+                prefetchedGeneration = searchResult.generation;
+                prefetchItem (0);
+            }
+        }
     }
 
     // Preview: estado, progreso, y cortarlo si su opción ya no está en la lista

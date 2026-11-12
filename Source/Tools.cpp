@@ -40,6 +40,24 @@ juce::File Tools::find (const juce::String& base)
     return local;
 }
 
+juce::File Tools::ytdlp()
+{
+   #if JUCE_WINDOWS
+    if (auto fast = ytdlpDir().getChildFile ("yt-dlp.exe"); fast.existsAsFile())
+        return fast;
+   #endif
+    return find ("yt-dlp");
+}
+
+bool Tools::ytdlpIsFastBuild()
+{
+   #if JUCE_WINDOWS
+    return ytdlpDir().getChildFile ("yt-dlp.exe").existsAsFile();
+   #else
+    return true;   // en Mac/Linux es el del sistema
+   #endif
+}
+
 static bool simulateMissingTools()
 {
     // Solo para capturas/pruebas: CLARABOYA_GRAB_TEST_NO_TOOLS=1

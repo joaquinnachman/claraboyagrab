@@ -2,33 +2,25 @@
 #include "GrabEngine.h"
 #include "Tools.h"
 
-#include <juce_audio_formats/juce_audio_formats.h>
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
-#include <iostream>
 
 namespace grab
 {
 namespace
 {
-    juce::String safeId (const juce::String& id)
-    {
-        auto s = id.retainCharacters ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_");
-        return s.isEmpty() ? juce::String ("preview") : s.substring (0, 40);
-    }
+    constexpr juce::int64 streamLifetimeMs = 4LL * 60 * 60 * 1000;   // los links de YouTube duran ~6 h
+    constexpr size_t maxRecentClips = 4;
+    constexpr size_t maxStreams = 60;
 
-    juce::String secs (double s)
-    {
-        return juce::String (s, 2);
-    }
+    juce::String secs (double s)       { return juce::String (s, 2); }
+    juce::int64 nowMs()                { return juce::Time::currentTimeMillis(); }
+    juce::uint32 tick()                { return juce::Time::getMillisecondCounter(); }
 }
 
 //==============================================================================
-juce::File PreviewPlayer::cacheFolder()
-{
-    return juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Claraboya Grab - previews");
-}
-
 double PreviewPlayer::chooseStart (double duration)
 {
     // Temas cortos: desde el principio. Si no, desde el 30 % (suele caer cerca del estribillo).
@@ -38,6 +30,42 @@ double PreviewPlayer::chooseStart (double duration)
     return juce::jlimit (0.0, duration - clipSeconds, std::round (duration * 0.3));
 }
 
+float PreviewPlayer::gainForRms (float rms) noexcept
+{
+    // Todas las opciones a un nivel parejo (~ -18 dBFS RMS), sin pasarse: de -15 a +6 dB.
+    constexpr float target = 0.13f;
+    if (rms < 1.0e-4f)
+        return 1.0f;
+    return juce::jlimit (0.18f, 2.0f, target / rms);
+}
+
+bool PreviewPlayer::parseResolveOutput (const juce::StringArray& lines, Stream& out)
+{
+    Stream s;
+
+    for (auto& l : lines)
+    {
+        if (l.startsWith ("URL|"))      s.url = l.substring (4).trim();
+        else if (l.startsWith ("UA|"))  s.userAgent = l.substring (3).trim();
+    }
+
+    if (s.userAgent == "NA")
+        s.userAgent = {};
+
+    if (! (s.url.startsWithIgnoreCase ("http") || s.url.startsWithIgnoreCase ("file:")))
+        return false;
+
+    s.resolvedAt = nowMs();
+    out = s;
+    return true;
+}
+
+juce::String PreviewPlayer::clipKey (const juce::String& videoId, double start, double rate)
+{
+    return videoId + "|" + juce::String ((int) start) + "|" + juce::String ((int) std::lround (rate));
+}
+
+//==============================================================================
 PreviewPlayer::PreviewPlayer (Engine& e) : juce::Thread ("Claraboya Grab - preview"), engine (e)
 {
     startThread();
@@ -52,69 +80,124 @@ PreviewPlayer::~PreviewPlayer()
     stopThread (8000);
 }
 
-void PreviewPlayer::killCurrentProcess()
+void PreviewPlayer::killCurrentProcess (const juce::String& keepResolveOf, bool keepPrefetch)
 {
-    const juce::ScopedLock sl (procLock);
-    if (currentProc != nullptr)
-        currentProc->kill();
+    const juce::ScopedLock pl (procLock);
+
+    if (currentProc == nullptr)
+        return;
+
+    if (keepResolveOf.isNotEmpty() && inFlightResolveId == keepResolveOf)
+        return;   // justo se está resolviendo este link: que termine
+
+    if (keepPrefetch && inFlightIsPrefetch)
+        return;
+
+    ++killSerial;
+    currentProc->kill();
 }
 
 //==============================================================================
 void PreviewPlayer::play (const juce::String& videoId, const juce::String& url, const juce::String& title, double duration)
 {
     const auto outputError = ensureOutput ? ensureOutput() : juce::String();
-    std::unique_ptr<Clip> old;
+    const double rate  = playbackRate.load() > 0.0 ? playbackRate.load() : 48000.0;
+    const double start = chooseStart (duration);
+    auto cached = outputError.isEmpty() ? findCachedClip (clipKey (videoId, start, rate)) : nullptr;
+    std::shared_ptr<Clip> old;
 
     {
         const juce::ScopedLock sl (lock);
         const int gen = ++latestGen;
+        playRequestedMs = tick();
 
         status = {};
         status.videoId = videoId;
         status.title = title;
-        status.startSec = chooseStart (duration);
-        status.lengthSec = duration > 0.0 ? juce::jmin (clipSeconds, duration - status.startSec) : clipSeconds;
+        status.startSec = start;
+        status.lengthSec = duration > 0.0 ? juce::jmin (clipSeconds, duration - start) : clipSeconds;
 
         if (outputError.isNotEmpty())
         {
             status.state = State::failed;
             status.error = TR ("no pude abrir la salida de audio (") + outputError + ")";
             hasPending = false;
+
+            const juce::SpinLock::ScopedLockType csl (clipLock);
+            playing = false;
+            old = std::move (current);
+        }
+        else if (cached != nullptr)
+        {
+            // Ya lo escuchaste hace un rato: suena al toque desde la memoria
+            {
+                const juce::SpinLock::ScopedLockType csl (clipLock);
+                old = std::move (current);
+                current = cached;
+                cached->pos = 0.0;
+                cached->env = 0.0f;
+                cached->gain = cached->targetGain.load();
+                stopRequested = false;
+                progress = 0.0f;
+                lastRenderMs = 0;
+                playStartedMs = tick();
+                playing = true;
+            }
+
+            status.state = State::playing;
+            hasPending = false;
+            lastTimeToSound = 0;
         }
         else
         {
             status.state = State::loading;
             pending = { videoId, url, title, duration, gen };
             hasPending = true;
-        }
 
-        const juce::SpinLock::ScopedLockType csl (clipLock);
-        playing = false;
-        std::swap (old, clip);
+            const juce::SpinLock::ScopedLockType csl (clipLock);
+            playing = false;
+            old = std::move (current);
+        }
     }
 
-    killCurrentProcess();   // si estaba cargando otro, se corta ya
+    // Lo que se estaba cargando para otra opción se corta; si justo se resolvía esta, que termine.
+    killCurrentProcess (videoId);
     ++revision;
     notify();
 }
 
 void PreviewPlayer::stop()
 {
-    std::unique_ptr<Clip> old;
-
     {
         const juce::ScopedLock sl (lock);
         ++latestGen;
         hasPending = false;
         status = {};
-
-        const juce::SpinLock::ScopedLockType csl (clipLock);
-        playing = false;
-        std::swap (old, clip);
     }
 
-    killCurrentProcess();
+    stopRequested = true;                 // el hilo de audio baja el volumen en 40 ms (sin click)
+    killCurrentProcess ({}, true);        // corta la carga, pero deja terminar un link que se resuelve por adelantado
     ++revision;
+}
+
+void PreviewPlayer::prefetch (const juce::String& videoId, const juce::String& url)
+{
+    if (videoId.isEmpty() || url.isEmpty() || isResolved (videoId))
+        return;
+
+    {
+        const juce::ScopedLock sl (lock);
+        prefetchId = videoId;
+        prefetchUrl = url;
+    }
+
+    notify();
+}
+
+bool PreviewPlayer::isResolved (const juce::String& videoId) const
+{
+    Stream s;
+    return cachedStream (videoId, s);
 }
 
 PreviewPlayer::Status PreviewPlayer::getStatus() const
@@ -135,9 +218,8 @@ PreviewPlayer::Status PreviewPlayer::getStatus() const
         else
         {
             s.progress = progress.load();
-            const auto now = juce::Time::getMillisecondCounter();
             const auto last = juce::jmax (lastRenderMs.load(), playStartedMs.load());
-            s.stalled = now - last > 1500;
+            s.stalled = tick() - last > 1500;
         }
     }
 
@@ -172,67 +254,108 @@ void PreviewPlayer::render (juce::AudioBuffer<float>& out, int startSample, int 
         return;
 
     const juce::SpinLock::ScopedTryLockType tl (clipLock);
-    if (! tl.isLocked() || clip == nullptr)
+    if (! tl.isLocked() || current == nullptr || numSamples <= 0)
         return;
 
-    const auto& a = clip->audio;
-    const int len = a.getNumSamples();
-    const int srcChannels = a.getNumChannels();
-    const int outChannels = out.getNumChannels();
+    auto& c = *current;
+    const int avail = c.available.load (std::memory_order_acquire);
+    const bool complete = c.complete.load (std::memory_order_acquire);
+    const int outChannels = juce::jmin (out.getNumChannels(), 8);
 
-    if (len < 2 || srcChannels == 0 || outChannels == 0 || numSamples <= 0)
-    {
-        playing = false;
+    if (outChannels == 0)
         return;
-    }
 
     const double rate = playbackRate.load();
-    const double step = rate > 0.0 ? clip->sampleRate / rate : 1.0;
-    int produced = numSamples;
+    const double step = rate > 0.0 ? c.sampleRate / rate : 1.0;
+    const float fadeIn   = (float) (1.0 / (0.015 * c.sampleRate));
+    const float fadeStop = (float) (1.0 / (0.040 * c.sampleRate));
+    const double tailFrames = 0.3 * c.sampleRate;
+    const float target = c.targetGain.load (std::memory_order_relaxed);
+    const bool stopping = stopRequested.load();
 
+    const float* srcL = c.audio.getReadPointer (0);
+    const float* srcR = c.audio.getReadPointer (1);
+    float* dst[8] {};
     for (int ch = 0; ch < outChannels; ++ch)
+        dst[ch] = out.getWritePointer (ch, startSample);
+
+    double pos = c.pos;
+    float env = c.env, gain = c.gain;
+    bool finished = false;
+
+    for (int i = 0; i < numSamples; ++i)
     {
-        const float* src = a.getReadPointer (juce::jmin (ch, srcChannels - 1));
-        float* dst = out.getWritePointer (ch, startSample);
-        double p = clip->pos;
+        const int idx = (int) pos;
 
-        for (int i = 0; i < numSamples; ++i)
+        if (idx + 1 >= avail)
         {
-            const int idx = (int) p;
+            if (complete)
+                finished = true;
+            break;   // si todavía está llegando audio: silencio un instante y sigue
+        }
 
-            if (idx >= len - 1)
+        if (stopping)
+        {
+            env -= fadeStop;
+            if (env <= 0.0f)
             {
-                produced = juce::jmin (produced, i);
+                finished = true;
                 break;
             }
-
-            const float frac = (float) (p - (double) idx);
-            dst[i] += src[idx] + (src[idx + 1] - src[idx]) * frac;
-            p += step;
         }
+        else if (env < 1.0f)
+        {
+            env = juce::jmin (1.0f, env + fadeIn);
+        }
+
+        float tail = 1.0f;
+        if (complete)
+        {
+            const double remaining = (double) (avail - 1) - pos;
+            if (remaining < tailFrames)
+                tail = (float) juce::jmax (0.0, remaining / tailFrames);
+        }
+
+        gain += (target - gain) * 0.00005f;   // la ganancia se acomoda suave (~0,5 s)
+        const float g = gain * env * tail;
+        const float frac = (float) (pos - (double) idx);
+        const float l = (srcL[idx] + (srcL[idx + 1] - srcL[idx]) * frac) * g;
+        const float r = (srcR[idx] + (srcR[idx + 1] - srcR[idx]) * frac) * g;
+
+        if (outChannels == 1)
+            dst[0][i] += 0.5f * (l + r);
+        else
+            for (int ch = 0; ch < outChannels; ++ch)
+                dst[ch][i] += (ch % 2 == 0) ? l : r;
+
+        pos += step;
     }
 
-    clip->pos += step * (double) produced;
+    c.pos = pos;
+    c.env = env;
+    c.gain = gain;
 
-    if (produced < numSamples)
+    if (finished)
+    {
         playing = false;
+        stopRequested = false;
+    }
 
-    progress.store ((float) juce::jlimit (0.0, 1.0, clip->pos / (double) len));
-    lastRenderMs.store (juce::Time::getMillisecondCounter());
+    progress.store ((float) juce::jlimit (0.0, 1.0, pos / (double) juce::jmax (1, c.planned)));
+    lastRenderMs.store (tick());
 }
 
 //==============================================================================
 void PreviewPlayer::run()
 {
-    // Fragmentos viejos de otras sesiones
-    for (auto& f : cacheFolder().findChildFiles (juce::File::findFilesAndDirectories, false))
-        if (f.getLastModificationTime() < juce::Time::getCurrentTime() - juce::RelativeTime::days (2))
-            f.deleteRecursively();
+    // La versión anterior guardaba fragmentos en disco: ya no hace falta.
+    juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Claraboya Grab - previews").deleteRecursively();
 
     while (! threadShouldExit())
     {
         Request req;
-        bool have = false;
+        bool havePlay = false;
+        juce::String pid, purl;
 
         {
             const juce::ScopedLock sl (lock);
@@ -240,57 +363,400 @@ void PreviewPlayer::run()
             {
                 req = pending;
                 hasPending = false;
-                have = true;
+                havePlay = true;
+            }
+            else if (prefetchId.isNotEmpty())
+            {
+                pid = prefetchId;
+                purl = prefetchUrl;
+                prefetchId = {};
             }
         }
 
-        if (! have)
+        if (havePlay)
+        {
+            if (! isStale (req.generation))
+                handlePlay (req);
+        }
+        else if (pid.isNotEmpty())
+        {
+            handlePrefetch (pid, purl);
+        }
+        else
         {
             wait (500);
-            continue;
         }
-
-        if (isStale (req.generation))
-            continue;
-
-        std::unique_ptr<Clip> loaded;
-        juce::String error;
-        const bool ok = loadClip (req, loaded, error);
-
-        if (isStale (req.generation))
-            continue;
-
-        if (! ok)
-        {
-            setStatus (req.generation, [&] (Status& s) { s.state = State::failed; s.error = error; });
-            continue;
-        }
-
-        {
-            const juce::ScopedLock sl (lock);
-
-            if (req.generation == latestGen.load())
-            {
-                {
-                    const juce::SpinLock::ScopedLockType csl (clipLock);
-                    std::swap (clip, loaded);
-                    progress = 0.0f;
-                    lastRenderMs = 0;
-                    playStartedMs = juce::Time::getMillisecondCounter();
-                    playing = true;
-                }
-
-                status.state = State::playing;
-                status.progress = 0.0f;
-            }
-        }
-
-        ++revision;
-        // "loaded" (el clip anterior o el que no se usó) se libera acá, nunca en el hilo de audio.
     }
 }
 
-int PreviewPlayer::runTool (const juce::StringArray& args, int generation, int timeoutMs,
+void PreviewPlayer::handlePrefetch (const juce::String& videoId, const juce::String& url)
+{
+    if (isResolved (videoId))
+        return;
+
+    const auto serial = killSerial.load();
+    const auto cancelled = [this, serial] { return threadShouldExit() || killSerial.load() != serial; };
+
+    {
+        const juce::ScopedLock pl (procLock);
+        inFlightResolveId = videoId;
+        inFlightIsPrefetch = true;
+    }
+
+    Stream s;
+    juce::String error;
+    resolve (videoId, url, true, s, error, cancelled);
+
+    const juce::ScopedLock pl (procLock);
+    inFlightResolveId = {};
+    inFlightIsPrefetch = false;
+}
+
+void PreviewPlayer::handlePlay (const Request& req)
+{
+    const auto stale = [this, g = req.generation] { return isStale (g); };
+    const double rate = playbackRate.load() > 0.0 ? playbackRate.load() : 48000.0;
+    const double start = chooseStart (req.duration);
+    const double len = req.duration > 0.0 ? juce::jmin (clipSeconds, req.duration - start) : clipSeconds;
+    const auto key = clipKey (req.videoId, start, rate);
+
+    if (auto cached = findCachedClip (key))
+    {
+        startPlaying (cached, req.generation);
+        return;
+    }
+
+    juce::String error;
+
+    // Primero el camino rápido (cliente sin JavaScript); si ese link no da audio, el de siempre.
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        const bool fast = attempt == 0;
+        if (! fast)
+            forgetStream (req.videoId);
+
+        Stream s;
+
+        {
+            const juce::ScopedLock pl (procLock);
+            inFlightResolveId = req.videoId;
+            inFlightIsPrefetch = false;
+        }
+
+        const bool resolved = resolve (req.videoId, req.url, fast, s, error, stale);
+
+        {
+            const juce::ScopedLock pl (procLock);
+            inFlightResolveId = {};
+        }
+
+        if (stale())
+            return;
+
+        if (! resolved)
+        {
+            if (fast)
+                continue;
+            break;
+        }
+
+        auto clip = std::make_shared<Clip>();
+        clip->sampleRate = rate;
+        clip->key = key;
+        clip->planned = juce::jmax (1, (int) std::ceil (len * rate));
+        clip->audio.setSize (2, clip->planned + (int) rate);   // un segundo de margen
+        clip->audio.clear();
+        clip->data[0] = clip->audio.getWritePointer (0);
+        clip->data[1] = clip->audio.getWritePointer (1);
+
+        if (streamInto (req, s, clip, error) || clip->available.load() > 0)
+            return;   // ya está sonando (o sonó entero)
+
+        if (stale())
+            return;
+
+        if (! s.fastClient)
+            break;
+    }
+
+    if (! stale())
+        setStatus (req.generation, [&] (Status& st)
+        {
+            st.state = State::failed;
+            st.error = error.isNotEmpty() ? error : TR ("no llegó audio de ese link.");
+        });
+}
+
+bool PreviewPlayer::resolve (const juce::String& videoId, const juce::String& url, bool fastClient, Stream& out,
+                             juce::String& error, const std::function<bool()>& isStaleFn)
+{
+    if (cachedStream (videoId, out))
+        return true;
+
+    if (! Tools::ytdlp().existsAsFile() || ! Tools::ffmpeg().existsAsFile())
+    {
+        error = TR ("faltan las herramientas: tocá INSTALAR.");
+        return false;
+    }
+
+    juce::StringArray a { Tools::ytdlp().getFullPathName(), "--ignore-config", "--no-warnings", "--no-playlist",
+                          "--encoding", "utf-8", "-f", "bestaudio/best[acodec!=none][height<=480]/best" };
+
+    if (auto deno = Tools::deno(); deno.existsAsFile())
+        a.addArray (juce::StringArray { "--js-runtimes", "deno:" + deno.getFullPathName() });
+
+    if (engine.getUseFirefoxCookies())
+        a.addArray (juce::StringArray { "--cookies-from-browser", "firefox" });
+
+    a.addArray (engine.getExtraYtdlpArgs());
+
+    // Cliente de YouTube que no necesita resolver el JavaScript del reproductor: una sola consulta, sin Deno.
+    if (fastClient)
+        a.addArray (juce::StringArray { "--extractor-args", "youtube:player_client=visionos;player_skip=webpage,configs" });
+
+    a.addArray (juce::StringArray { "--print", "URL|%(url)s", "--print", "UA|%(http_headers.User-Agent)s", "--", url });
+
+    juce::StringArray lines;
+    juce::String lastError;
+    const int code = runTool (a, isStaleFn, 60000, [&] (const juce::String& l)
+    {
+        if (l.startsWith ("ERROR:"))
+            lastError = l.substring (6).trim();
+        lines.add (l);
+    });
+
+    Stream s;
+    if (code != 0 || ! parseResolveOutput (lines, s))
+    {
+        error = isStaleFn() ? juce::String() : (code == -2000 ? TR ("tardó demasiado.") : Engine::friendlyError (lastError));
+        return false;
+    }
+
+    s.fastClient = fastClient;
+
+    {
+        const juce::ScopedLock cl (cacheLock);
+        if (streams.size() > maxStreams)
+            streams.clear();
+        streams[videoId] = s;
+    }
+
+    out = s;
+    return true;
+}
+
+bool PreviewPlayer::streamInto (const Request& req, const Stream& s, const std::shared_ptr<Clip>& clip, juce::String& error)
+{
+    const auto stale = [this, g = req.generation] { return isStale (g); };
+    const double rate  = clip->sampleRate;
+    const double start = chooseStart (req.duration);
+    const double len   = (double) clip->planned / rate;
+
+    juce::StringArray ff { Tools::ffmpeg().getFullPathName(), "-hide_banner", "-nostdin", "-loglevel", "error" };
+
+    if (s.url.startsWithIgnoreCase ("http"))
+    {
+        if (s.userAgent.isNotEmpty())
+            ff.addArray (juce::StringArray { "-user_agent", s.userAgent });
+        ff.addArray (juce::StringArray { "-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "2" });
+    }
+
+    // Archivo local (file://...): FFmpeg quiere la ruta, no el link con %20.
+    auto input = s.url;
+    if (input.startsWithIgnoreCase ("file:"))
+        input = juce::URL (input).getLocalFile().getFullPathName();
+
+    // Arranca directo en el punto del preview y manda audio decodificado a medida que llega.
+    ff.addArray (juce::StringArray { "-ss", secs (start), "-t", secs (len), "-i", input, "-vn", "-sn", "-dn",
+                                     "-ac", "2", "-ar", juce::String ((int) std::lround (rate)), "-f", "f32le", "-" });
+
+    juce::ChildProcess proc;
+    if (! proc.start (ff, juce::ChildProcess::wantStdOut))
+    {
+        error = TR ("no pude ejecutar FFmpeg.");
+        return false;
+    }
+
+    {
+        const juce::ScopedLock pl (procLock);
+        currentProc = &proc;
+    }
+
+    const int startFrames = (int) (rate * startBuffer);
+    const int capacity = clip->audio.getNumSamples();
+    constexpr int chunk = 16384;
+    juce::HeapBlock<char> buffer (chunk + 16);
+    std::vector<float> frame (chunk / sizeof (float) + 4);
+    size_t carry = 0;
+    double sumSquares = 0.0;
+    juce::int64 counted = 0;
+    bool started = false, finishedOk = false;
+    const auto deadline = tick() + 60000;
+
+    for (;;)
+    {
+        if (stale() || tick() > deadline)
+        {
+            proc.kill();
+            break;
+        }
+
+        const int n = proc.readProcessOutput (buffer.get() + carry, chunk);
+
+        if (n <= 0)
+        {
+            if (! proc.isRunning())
+            {
+                finishedOk = proc.getExitCode() == 0;
+                break;
+            }
+            juce::Thread::sleep (5);
+            continue;
+        }
+
+        const size_t total = carry + (size_t) n;
+        const size_t frames = total / (2 * sizeof (float));
+        const int avail = clip->available.load (std::memory_order_relaxed);
+        const int toWrite = (int) juce::jmin ((size_t) (capacity - avail), frames);
+
+        std::memcpy (frame.data(), buffer.get(), frames * 2 * sizeof (float));
+
+        for (int i = 0; i < toWrite; ++i)
+        {
+            const float l = frame[(size_t) (2 * i)], r = frame[(size_t) (2 * i + 1)];
+            clip->data[0][avail + i] = l;
+            clip->data[1][avail + i] = r;
+            sumSquares += (double) l * l + (double) r * r;
+        }
+
+        counted += 2 * toWrite;
+        clip->available.store (avail + toWrite, std::memory_order_release);
+
+        if (counted > 0)
+            clip->targetGain.store (gainForRms ((float) std::sqrt (sumSquares / (double) counted)));
+
+        carry = total - frames * 2 * sizeof (float);
+        if (carry > 0)
+            std::memmove (buffer.get(), buffer.get() + frames * 2 * sizeof (float), carry);
+
+        if (! started && avail + toWrite >= startFrames)
+        {
+            started = true;
+            startPlaying (clip, req.generation);
+        }
+
+        if (avail + toWrite >= capacity)
+        {
+            proc.kill();
+            finishedOk = true;
+            break;
+        }
+    }
+
+    {
+        const juce::ScopedLock pl (procLock);
+        currentProc = nullptr;
+    }
+
+    clip->complete.store (true, std::memory_order_release);
+
+    if (stale())
+        return false;
+
+    const int got = clip->available.load();
+
+    if (! started && got > 0)
+        startPlaying (clip, req.generation);
+
+    if (got == 0)
+    {
+        error = TR ("no llegó audio de ese link.");
+        return false;
+    }
+
+    if (finishedOk || got >= (int) (rate * 5.0))
+        rememberClip (clip);
+
+    return true;
+}
+
+void PreviewPlayer::startPlaying (const std::shared_ptr<Clip>& clip, int generation)
+{
+    std::shared_ptr<Clip> old;
+
+    {
+        const juce::ScopedLock sl (lock);
+        if (generation != latestGen.load())
+            return;
+
+        {
+            const juce::SpinLock::ScopedLockType csl (clipLock);
+            old = std::move (current);
+            current = clip;
+            clip->pos = 0.0;
+            clip->env = 0.0f;
+            clip->gain = clip->targetGain.load();
+            stopRequested = false;
+            progress = 0.0f;
+            lastRenderMs = 0;
+            playStartedMs = tick();
+            playing = true;
+        }
+
+        status.state = State::playing;
+        status.progress = 0.0f;
+        lastTimeToSound = (int) (tick() - playRequestedMs.load());
+    }
+
+    ++revision;
+    // "old" se libera acá, nunca en el hilo de audio
+}
+
+//==============================================================================
+std::shared_ptr<PreviewPlayer::Clip> PreviewPlayer::findCachedClip (const juce::String& key)
+{
+    const juce::ScopedLock cl (cacheLock);
+    for (auto& c : recentClips)
+        if (c->key == key && c->complete.load())
+            return c;
+    return nullptr;
+}
+
+void PreviewPlayer::rememberClip (const std::shared_ptr<Clip>& clip)
+{
+    std::shared_ptr<Clip> dropped;   // se libera fuera del lock
+    const juce::ScopedLock cl (cacheLock);
+
+    recentClips.erase (std::remove_if (recentClips.begin(), recentClips.end(),
+                                       [&] (const std::shared_ptr<Clip>& c) { return c->key == clip->key; }),
+                       recentClips.end());
+    recentClips.push_back (clip);
+
+    if (recentClips.size() > maxRecentClips)
+    {
+        dropped = recentClips.front();
+        recentClips.erase (recentClips.begin());
+    }
+}
+
+bool PreviewPlayer::cachedStream (const juce::String& videoId, Stream& out) const
+{
+    const juce::ScopedLock cl (cacheLock);
+    if (auto it = streams.find (videoId); it != streams.end() && nowMs() - it->second.resolvedAt < streamLifetimeMs)
+    {
+        out = it->second;
+        return true;
+    }
+    return false;
+}
+
+void PreviewPlayer::forgetStream (const juce::String& videoId)
+{
+    const juce::ScopedLock cl (cacheLock);
+    streams.erase (videoId);
+}
+
+int PreviewPlayer::runTool (const juce::StringArray& args, const std::function<bool()>& isStaleFn, int timeoutMs,
                             const std::function<void (const juce::String&)>& onLine)
 {
     juce::ChildProcess proc;
@@ -303,10 +769,11 @@ int PreviewPlayer::runTool (const juce::StringArray& args, int generation, int t
         currentProc = &proc;
     }
 
-    const auto deadline = juce::Time::getMillisecondCounter() + (juce::uint32) timeoutMs;
+    const auto deadline = tick() + (juce::uint32) timeoutMs;
     std::string line;
     char buffer[32];
-    int result = 0;
+    int result = 0, exitCode = 0;
+    bool finished = false;
 
     auto emit = [&]
     {
@@ -315,12 +782,9 @@ int PreviewPlayer::runTool (const juce::StringArray& args, int generation, int t
         line.clear();
     };
 
-    int exitCode = 0;
-    bool finished = false;
-
     for (;;)
     {
-        if (isStale (generation) || juce::Time::getMillisecondCounter() > deadline)
+        if (isStaleFn() || tick() > deadline)
         {
             proc.kill();
             result = -2000;
@@ -364,140 +828,5 @@ int PreviewPlayer::runTool (const juce::StringArray& args, int generation, int t
     }
 
     return result != 0 ? result : exitCode;
-}
-
-bool PreviewPlayer::loadClip (const Request& req, std::unique_ptr<Clip>& out, juce::String& error)
-{
-    if (! Tools::ytdlp().existsAsFile() || ! Tools::ffmpeg().existsAsFile())
-    {
-        error = TR ("faltan las herramientas: tocá INSTALAR.");
-        return false;
-    }
-
-    const double rate  = playbackRate.load() > 0.0 ? playbackRate.load() : 48000.0;
-    const double start = chooseStart (req.duration);
-    const double len   = req.duration > 0.0 ? juce::jmin (clipSeconds, req.duration - start) : clipSeconds;
-
-    const auto dir = cacheFolder();
-    dir.createDirectory();
-
-    const auto cached = dir.getChildFile (safeId (req.videoId) + "-" + juce::String ((int) start) + "-"
-                                          + juce::String ((int) std::lround (rate)) + ".wav");
-
-    if (! cached.existsAsFile())
-    {
-        const auto tmp = dir.getChildFile (safeId (req.videoId) + "-"
-                                           + juce::String::toHexString (juce::Random::getSystemRandom().nextInt()));
-        tmp.createDirectory();
-
-        // 1) Solo el fragmento, sin bajar el tema entero (YouTube lo permite).
-        //    Si la plataforma no deja bajar un pedazo, se baja el audio completo y se recorta después.
-        auto ytdlpArgs = [&] (bool onlySection)
-        {
-            juce::StringArray a { Tools::ytdlp().getFullPathName(), "--newline", "--color", "never", "--encoding", "utf-8",
-                                  "--no-playlist", "--no-mtime", "-f", "bestaudio/best", "--ffmpeg-location",
-                                  Tools::ffmpeg().getParentDirectory().getFullPathName() };
-
-            if (auto deno = Tools::deno(); deno.existsAsFile())
-                a.addArray (juce::StringArray { "--js-runtimes", "deno:" + deno.getFullPathName() });
-
-            if (engine.getUseFirefoxCookies())
-                a.addArray (juce::StringArray { "--cookies-from-browser", "firefox" });
-
-            a.addArray (engine.getExtraYtdlpArgs());
-
-            if (onlySection)
-                a.addArray (juce::StringArray { "--download-sections", "*" + secs (start) + "-" + secs (start + len) });
-
-            a.addArray (juce::StringArray { "-o", tmp.getFullPathName() + juce::File::getSeparatorString() + "%(id)s.%(ext)s",
-                                            "--print", "after_move:FILE|%(filepath)s", "--", req.url });
-            return a;
-        };
-
-        juce::String printed, lastError;
-        auto onLine = [&] (const juce::String& l)
-        {
-            if (juce::SystemStats::getEnvironmentVariable ("CLARABOYA_GRAB_DEBUG", {}).isNotEmpty())
-                std::cerr << "[preview] " << l << std::endl;
-
-            if (l.startsWith ("FILE|"))        printed = l.substring (5).trim();
-            else if (l.startsWith ("ERROR:"))  lastError = l.substring (6).trim();
-        };
-
-        bool wholeFile = false;
-        int code = runTool (ytdlpArgs (true), req.generation, 120000, onLine);
-
-        if (code != 0 && ! isStale (req.generation) && lastError.containsIgnoreCase ("partially downloaded"))
-        {
-            wholeFile = true;
-            printed = lastError = {};
-            code = runTool (ytdlpArgs (false), req.generation, 180000, onLine);
-        }
-
-        if (isStale (req.generation))
-        {
-            tmp.deleteRecursively();
-            return false;
-        }
-
-        auto section = juce::File::isAbsolutePath (printed) ? juce::File (printed) : juce::File();
-        if (! section.existsAsFile())
-            for (auto& f : tmp.findChildFiles (juce::File::findFiles, false))
-                if (! f.hasFileExtension ("part;ytdl;json;tmp"))
-                    { section = f; break; }
-
-        if (code != 0 || ! section.existsAsFile())
-        {
-            tmp.deleteRecursively();
-            error = code == -2000 ? TR ("tardó demasiado.") : Engine::friendlyError (lastError);
-            return false;
-        }
-
-        // 2) WAV nivelado (-16 LUFS) con fundidos cortos, a la frecuencia a la que va a sonar.
-        const auto part = dir.getChildFile (cached.getFileNameWithoutExtension() + ".tmp.wav");
-        const auto fadeOut = juce::jmax (0.0, len - 0.6);
-
-        juce::StringArray ff { Tools::ffmpeg().getFullPathName(), "-hide_banner", "-nostdin", "-loglevel", "error", "-y" };
-
-        if (wholeFile)
-            ff.addArray (juce::StringArray { "-ss", secs (start), "-t", secs (len) });
-
-        ff.addArray (juce::StringArray { "-i", section.getFullPathName(), "-vn", "-sn", "-dn", "-ac", "2",
-                               "-ar", juce::String ((int) std::lround (rate)),
-                               // asetpts: el pedazo puede venir con la hora original (ej. 1:28); se lleva a 0
-                               "-af", "asetpts=PTS-STARTPTS,loudnorm=I=-16:TP=-1.5:LRA=11,afade=t=in:d=0.2,afade=t=out:st="
-                                      + secs (fadeOut) + ":d=0.6",
-                               "-t", secs (len), "-c:a", "pcm_f32le", part.getFullPathName() });
-
-        juce::String ffError;
-        const int ffCode = runTool (ff, req.generation, 60000, [&] (const juce::String& l) { ffError = l; });
-        tmp.deleteRecursively();
-
-        if (ffCode != 0 || ! part.existsAsFile() || ! part.moveFileTo (cached))
-        {
-            part.deleteFile();
-            error = isStale (req.generation) ? juce::String() : TR ("no pude preparar el audio") + (ffError.isNotEmpty() ? ": " + ffError.substring (0, 100) : juce::String());
-            return false;
-        }
-    }
-
-    // 3) A memoria
-    juce::WavAudioFormat wav;
-    std::unique_ptr<juce::AudioFormatReader> reader (wav.createReaderFor (new juce::FileInputStream (cached), true));
-
-    if (reader == nullptr || reader->lengthInSamples < 100)
-    {
-        cached.deleteFile();
-        error = TR ("el fragmento vino vacío.");
-        return false;
-    }
-
-    auto c = std::make_unique<Clip>();
-    c->sampleRate = reader->sampleRate;
-    c->audio.setSize (juce::jmax (1, (int) reader->numChannels), (int) reader->lengthInSamples);
-    reader->read (&c->audio, 0, (int) reader->lengthInSamples, 0, true, true);
-
-    out = std::move (c);
-    return true;
 }
 }

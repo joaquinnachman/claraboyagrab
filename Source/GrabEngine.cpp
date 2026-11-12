@@ -47,6 +47,8 @@ Engine::Engine() : juce::Thread ("Claraboya Grab")
         if (Tools::allInstalled())
             refreshVersion();
     });
+
+    push ([this] { maintainYtdlp(); });
 }
 
 Engine::~Engine()
@@ -984,22 +986,13 @@ void Engine::doInstall (bool forceAll)
     if (! ok)
         err = TR ("no pude crear ") + bin.getFullPathName();
 
-    if (ok && (forceAll || ! Tools::ytdlp().existsAsFile()))
-    {
-        const auto tmp = staging.getChildFile ("yt-dlp.exe");
-        ok = downloadUrlToFile (Tools::ytdlpUrl, tmp, "yt-dlp", 0.0f, 0.12f, err);
-
-        if (ok && ! tmp.moveFileTo (bin.getChildFile ("yt-dlp.exe")))
-        {
-            ok = false;
-            err = TR ("no pude reemplazar yt-dlp.exe (¿se está usando?)");
-        }
-    }
+    if (ok && (forceAll || ! Tools::ytdlpIsFastBuild()))
+        ok = installYtdlp (0.0f, 0.15f, err);
 
     if (ok && (forceAll || ! Tools::deno().existsAsFile()))
     {
         const auto zip = staging.getChildFile ("deno.zip");
-        ok = downloadUrlToFile (Tools::denoUrl, zip, "Deno", 0.12f, 0.40f, err)
+        ok = downloadUrlToFile (Tools::denoUrl, zip, "Deno", 0.15f, 0.40f, err)
           && extractFromZip (zip, { "deno.exe" }, bin, err);
     }
 
@@ -1053,8 +1046,27 @@ void Engine::doUpdate()
     setTools ([] (ToolStatus& t) { t.busy = true; t.progress = -1.0f; t.text = TR ("Actualizando yt-dlp…"); });
 
     juce::String result;
-    int code = -1;
+    bool ok = false;
 
+   #if JUCE_WINDOWS
+    // La versión en carpeta no se actualiza sola (-U): se baja de nuevo si hay una más nueva.
+    const auto installed = getToolStatus().version;
+    const auto latest = latestYtdlpVersion();
+
+    if (Tools::ytdlpIsFastBuild() && latest.isNotEmpty() && latest == installed)
+    {
+        ok = true;
+        result = TR ("yt-dlp ya estaba al día (") + installed + ")";
+    }
+    else
+    {
+        juce::String err;
+        ok = installYtdlp (0.0f, 1.0f, err);
+        refreshVersion();
+        result = ok ? TR ("yt-dlp actualizado (") + getToolStatus().version + ")"
+                    : TR ("No se pudo actualizar yt-dlp: ") + err;
+    }
+   #else
     if (Tools::ytdlp().existsAsFile())
     {
         juce::StringArray a;
@@ -1062,27 +1074,182 @@ void Engine::doUpdate()
         a.addArray (juce::StringArray { "-U", "--color", "never" });
 
         juce::String all;
-        code = runProcess (a, 0, [&] (const juce::String& l) { all << l << "\n"; });
+        const int code = runProcess (a, 0, [&] (const juce::String& l) { all << l << "\n"; });
+        ok = code == 0;
 
         if (all.containsIgnoreCase ("up to date"))          result = TR ("yt-dlp ya estaba al día");
         else if (all.containsIgnoreCase ("Updated yt-dlp")) result = TR ("yt-dlp actualizado");
-        else if (code == 0)                                 result = TR ("yt-dlp revisado");
+        else if (ok)                                        result = TR ("yt-dlp revisado");
         else result = TR ("No se pudo actualizar: ") + all.trim().fromLastOccurrenceOf ("\n", false, false).substring (0, 120);
     }
     else
     {
         result = TR ("Falta yt-dlp: tocá INSTALAR");
     }
+   #endif
 
     refreshVersion();
 
     setTools ([&] (ToolStatus& t)
     {
         t.busy = false;
+        t.progress = -1.0f;
         t.installed = Tools::allInstalled();
-        t.lastFailed = code != 0;
+        t.lastFailed = ! ok;
         t.text = result;
     });
+}
+
+bool Engine::installYtdlp (float p0, float p1, juce::String& err)
+{
+   #if JUCE_WINDOWS
+    const auto bin = Tools::binDir();
+    const auto zip = bin.getChildFile ("yt-dlp_win.zip");
+    const auto fresh = bin.getChildFile ("yt-dlp.nuevo");
+    const auto target = Tools::ytdlpDir();
+
+    if (! bin.createDirectory())
+    {
+        err = TR ("no pude crear ") + bin.getFullPathName();
+        return false;
+    }
+
+    if (! downloadUrlToFile (Tools::ytdlpZipUrl, zip, "yt-dlp", p0, p0 + (p1 - p0) * 0.85f, err))
+        return false;
+
+    setTools ([] (ToolStatus& t) { t.text = TR ("Descomprimiendo yt-dlp…"); });
+    fresh.deleteRecursively();
+
+    {
+        juce::ZipFile z (zip);
+        const auto r = z.uncompressTo (fresh, true);
+
+        if (r.failed() || ! fresh.getChildFile ("yt-dlp.exe").existsAsFile())
+        {
+            zip.deleteFile();
+            fresh.deleteRecursively();
+            err = TR ("el zip de yt-dlp vino incompleto");
+            return false;
+        }
+    }
+
+    zip.deleteFile();
+
+    // Cambiar la carpeta vieja por la nueva (si justo se está usando, reintenta un rato)
+    const auto old = bin.getChildFile ("yt-dlp.viejo-" + juce::String::toHexString (juce::Random::getSystemRandom().nextInt()));
+    bool swapped = false;
+
+    for (int i = 0; i < 20 && ! swapped && ! threadShouldExit(); ++i)
+    {
+        if (target.exists() && ! target.moveFileTo (old))
+        {
+            juce::Thread::sleep (500);
+            continue;
+        }
+
+        swapped = fresh.moveFileTo (target);
+        if (! swapped)
+            juce::Thread::sleep (500);
+    }
+
+    if (! swapped)
+    {
+        err = TR ("yt-dlp se está usando; probá de nuevo en un rato");
+        return false;
+    }
+
+    // Limpieza: carpetas viejas y el .exe suelto de versiones anteriores
+    for (auto& d : bin.findChildFiles (juce::File::findDirectories, false, "yt-dlp.viejo-*"))
+        d.deleteRecursively();
+    bin.getChildFile ("yt-dlp.exe").deleteFile();
+
+    setTools ([p1] (ToolStatus& t) { t.progress = p1; });
+    return true;
+   #else
+    juce::ignoreUnused (p0, p1);
+    err = TR ("en Mac/Linux se usa el yt-dlp del sistema");
+    return false;
+   #endif
+}
+
+juce::String Engine::latestYtdlpVersion()
+{
+    int status = 0;
+    auto opts = juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                    .withConnectionTimeoutMs (10000)
+                    .withStatusCode (&status)
+                    .withExtraHeaders ("Accept: application/vnd.github+json\r\nUser-Agent: ClaraboyaGrab\r\n");
+
+    if (auto in = juce::URL::createWithoutParsing (Tools::ytdlpLatestApi).createInputStream (opts); in != nullptr && status == 200)
+        return juce::JSON::parse (in->readEntireStreamAsString()).getProperty ("tag_name", {}).toString().trim();
+
+    return {};
+}
+
+void Engine::maintainYtdlp()
+{
+   #if JUCE_WINDOWS
+    if (! Tools::allInstalled())
+        return;
+
+    const auto ownsBanner = [this] { return ! getToolStatus().busy; };
+
+    // 1) Instalaciones viejas (yt-dlp.exe suelto): pasar a la versión en carpeta, que arranca mucho más rápido.
+    if (! Tools::ytdlpIsFastBuild())
+    {
+        if (! ownsBanner())
+            return;
+
+        setTools ([] (ToolStatus& t) { t.busy = true; t.progress = 0.0f; t.text = TR ("Pasando yt-dlp a la versión rápida (una sola vez)…"); });
+        juce::String err;
+        const bool ok = installYtdlp (0.0f, 1.0f, err);
+        refreshVersion();
+        setTools ([&] (ToolStatus& t)
+        {
+            t.busy = false;
+            t.progress = -1.0f;
+            t.installed = Tools::allInstalled();
+            t.text = ok ? TR ("yt-dlp listo (versión rápida)") : TR ("No se pudo pasar yt-dlp a la versión rápida: ") + err;
+        });
+        return;
+    }
+
+    // 2) Una vez por día: si salió un yt-dlp nuevo, bajarlo (YouTube cambia seguido y los viejos dejan de andar).
+    const auto now = juce::Time::currentTimeMillis();
+    juce::int64 last = 0;
+    {
+        const juce::ScopedLock sl (settingsLock);
+        last = props.getUserSettings()->getValue ("ytdlpCheckedAt", "0").getLargeIntValue();
+    }
+
+    if (now - last < 24LL * 60 * 60 * 1000)
+        return;
+
+    const auto latest = latestYtdlpVersion();
+    if (latest.isEmpty())
+        return;
+
+    {
+        const juce::ScopedLock sl (settingsLock);
+        props.getUserSettings()->setValue ("ytdlpCheckedAt", juce::String (now));
+        props.saveIfNeeded();
+    }
+
+    if (latest != getToolStatus().version && ownsBanner())
+    {
+        setTools ([&] (ToolStatus& t) { t.busy = true; t.progress = 0.0f; t.text = TR ("Actualizando yt-dlp a ") + latest + TR ("…"); });
+        juce::String err;
+        const bool ok = installYtdlp (0.0f, 1.0f, err);
+        refreshVersion();
+        setTools ([&] (ToolStatus& t)
+        {
+            t.busy = false;
+            t.progress = -1.0f;
+            t.installed = Tools::allInstalled();
+            t.text = ok ? TR ("yt-dlp actualizado (") + t.version + ")" : TR ("No se pudo actualizar yt-dlp: ") + err;
+        });
+    }
+   #endif
 }
 
 void Engine::refreshVersion()

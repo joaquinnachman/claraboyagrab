@@ -107,6 +107,9 @@ namespace grab
         void doInstall (bool forceAll);
         void doUpdate();
         void refreshVersion();
+        bool installYtdlp (float p0, float p1, juce::String& error);
+        juce::String latestYtdlpVersion();
+        void maintainYtdlp();
 
         bool downloadUrlToFile (const juce::String& url, const juce::File& dest, const juce::String& label,
                                 float p0, float p1, juce::String& error);

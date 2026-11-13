@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "Common.h"
@@ -13,8 +14,9 @@
 /*  Preview: escuchar ~30 s de una opción antes de bajarla, rápido.
 
     1. yt-dlp solo resuelve el link del audio (con un cliente de YouTube que no necesita
-       JavaScript; si falla, el de siempre). Ese link se guarda unas horas y se pide por
-       adelantado para las primeras opciones y la que está bajo el mouse.
+       JavaScript ni sesión y no tiene publicidad; si falla, el de siempre). Ese link se guarda
+       unas horas y se pide por adelantado, de a 3 a la vez, para las primeras opciones apenas
+       aparecen y para la que está bajo el mouse.
     2. Si el tema tiene publicidad al principio, YouTube no deja usar el link hasta que
        "pasaría" el anuncio (available_at): se espera ese tiempo, y como el link se pidió
        por adelantado, normalmente la espera ya pasó cuando tocás play.
@@ -134,9 +136,13 @@ namespace grab
 
         void run() override;
         void handlePlay (const Request&);
-        void handlePrefetch (const juce::String& videoId, const juce::String& url);
+        class PrefetchWorker;
+        void handlePrefetch (const juce::String& videoId, const juce::String& url, const std::function<bool()>& cancelled);
+        void notifyWorkers();
+        bool waitForPrefetchOf (const juce::String& videoId, int generation);
+        bool fastClientAllowed() const noexcept { return fastResolveFailures.load() < 3; }
         bool resolve (const juce::String& videoId, const juce::String& url, bool fastClient, Stream& out,
-                      juce::String& error, const std::function<bool()>& isStale);
+                      juce::String& error, const std::function<bool()>& isStale, bool killable = true);
         bool waitUntilAvailable (const Request&, juce::int64 untilMs);
         bool streamInto (const Request&, const juce::String& input, const juce::String& headerBlock,
                          double startSec, const std::shared_ptr<Clip>&, juce::String& error);
@@ -147,7 +153,7 @@ namespace grab
         static void log (const juce::String&);
         void startPlaying (const std::shared_ptr<Clip>&, int generation);
         int runTool (const juce::StringArray& args, const std::function<bool()>& isStale, int timeoutMs,
-                     const std::function<void (const juce::String&)>& onLine);
+                     const std::function<void (const juce::String&)>& onLine, bool killable = true);
         void killCurrentProcess (const juce::String& keepResolveOf = {}, bool keepPrefetch = false);
         void forgetStream (const juce::String& videoId);
         bool isStale (int generation) const { return threadShouldExit() || generation != latestGen.load(); }
@@ -162,7 +168,9 @@ namespace grab
         mutable juce::CriticalSection lock;
         Request pending;
         bool hasPending = false;
-        std::vector<std::pair<juce::String, juce::String>> prefetchQueue;   // id, link
+        std::vector<std::pair<juce::String, juce::String>> prefetchQueue;   // id, link (lo toman los PrefetchWorker)
+        std::set<juce::String> prefetchInFlight;
+        std::vector<std::unique_ptr<PrefetchWorker>> workers;
         Status status;
         std::atomic<int> latestGen { 0 };
         std::atomic<juce::uint32> revision { 1 };
@@ -193,6 +201,7 @@ namespace grab
         // Camino que se usa en esta sesión: 0 = link con el cliente rápido, 1 = link con el cliente
         // normal, 2 = plan B directo. Baja un escalón cuando uno falla y el plan B sí anda.
         std::atomic<int> pathLevel { 0 };
+        std::atomic<int> fastResolveFailures { 0 };   // seguidas: con 3, en esta sesión ya no se prueba el rápido
         std::atomic<bool> forceSlowPath { false };
 
         bool hasTestStatus = false;

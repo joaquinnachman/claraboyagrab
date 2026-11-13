@@ -530,6 +530,54 @@ static void previewTest()
         pp.stop();
     }
 
+    // Las primeras opciones se adelantan de a varias a la vez, y si tocás una que se está
+    // adelantando, se espera a esa (no se pide otro link)
+    {
+        const auto logBefore = PreviewPlayer::logFile().getSize();
+        std::vector<std::pair<juce::String, juce::String>> six;
+        for (int i = 1; i <= 6; ++i)
+            six.push_back ({ "varios-" + juce::String (i), bigUrl + "?v=" + juce::String (i) });
+
+        const auto t0 = juce::Time::getMillisecondCounter();
+        pp.prefetchMany (six);
+        juce::Thread::sleep (300);
+        pp.play ("varios-2", bigUrl + "?v=2", "Varios 2", 300.0);   // justo se está adelantando
+        waitForPreview (pp, 60000);
+        check (pp.getStatus().state == PreviewPlayer::State::playing, "tocar una que se está adelantando: suena", pp.getStatus().error);
+
+        bool all = false;
+        for (int i = 0; i < 600 && ! all; ++i)
+        {
+            all = true;
+            for (auto& p : six)
+                all = all && pp.isResolved (p.first);
+            if (! all) juce::Thread::sleep (50);
+        }
+        const auto ms = (int) (juce::Time::getMillisecondCounter() - t0);
+        std::cout << "      6 opciones adelantadas en " << ms << " ms (de a 3)\n";
+        check (all, "adelanta las 6 primeras opciones");
+        const auto log = logSince (logBefore);
+        const auto afterPlay = log.fromFirstOccurrenceOf ("[varios-2]", false, false);
+        std::cout << "      al tocarla: " << afterPlay.fromFirstOccurrenceOf ("link (", true, false).upToFirstOccurrenceOf ("\n", false, false) << "\n";
+        pp.stop();
+    }
+
+    // Con «Usar sesión de Firefox» activado, el camino rápido va sin sesión (no la acepta y leerla tarda)
+    {
+        Engine ec;
+        const bool before = ec.getUseFirefoxCookies();
+        ec.setUseFirefoxCookies (true);   // en esta máquina no hay Firefox: si se usara, fallaría
+        PreviewPlayer pc (ec);
+        pc.setPlaybackRate (48000.0);
+        bool slow = false;
+        pc.play ("con-firefox", bigUrl + "?f=1", "Con Firefox", 300.0);
+        waitForPreview (pc, 60000, nullptr, &slow);
+        check (pc.getStatus().state == PreviewPlayer::State::playing && ! slow,
+               "con sesión de Firefox activada: suena por el camino rápido", pc.getStatus().error);
+        pc.stop();
+        ec.setUseFirefoxCookies (before);
+    }
+
     // YouTube: si el tema tiene publicidad, el link no se puede usar hasta que "pasaría" el anuncio
     {
         Engine ew;

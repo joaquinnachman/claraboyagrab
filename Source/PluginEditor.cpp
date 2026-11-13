@@ -712,11 +712,11 @@ public:
         g.drawFittedText (sub, line2.withHeight (16), juce::Justification::centredLeft, 1, 0.85f);
     }
 
-    void mouseEnter (const juce::MouseEvent& e) override { hover = true; mouseMove (e); repaint(); }
+    // Con el mouse en cualquier parte de la fila ya se prepara su preview.
+    void mouseEnter (const juce::MouseEvent& e) override { hover = true; owner.hoverThumb (row, true); mouseMove (e); repaint(); }
     void mouseExit  (const juce::MouseEvent&) override
     {
-        if (overThumb)
-            owner.hoverThumb (row, false);
+        owner.hoverThumb (row, false);
         hover = overThumb = false;
         repaint();
     }
@@ -727,7 +727,6 @@ public:
         if (over != overThumb)
         {
             overThumb = over;
-            owner.hoverThumb (row, over);
             repaint();
         }
     }
@@ -1436,6 +1435,17 @@ void GrabEditor::showSettings()
         if (safe != nullptr)
             safe->engine.setUseFirefoxCookies (! safe->engine.getUseFirefoxCookies());
     });
+    m.addItem (TR ("Mostrar registro del preview (para mandar si algo anda mal)"), [safe]
+    {
+        if (safe == nullptr) return;
+        auto f = grab::PreviewPlayer::logFile();
+        if (! f.existsAsFile())
+        {
+            safe->toast (TR ("Todavía no hay nada anotado: escuchá un preview primero."));
+            return;
+        }
+        f.revealToUser();   // abre la carpeta con el archivo marcado: se puede arrastrar a un chat o mail
+    });
     m.addSeparator();
     m.addItem (TR ("Actualizar yt-dlp"), st.installed && ! st.busy, false, [safe] { if (safe != nullptr) safe->engine.enqueueUpdateYtdlp(); });
     if (grab::Tools::canAutoInstall())
@@ -1634,25 +1644,25 @@ void GrabEditor::timerCallback()
         results->refresh();
     }
 
-    // Preview más rápido: resolver por adelantado la opción bajo el mouse (a los 150 ms)
-    // y las primeras de cada búsqueda (cuando los resultados quedan quietos 0,7 s). Así la espera
-    // que pide YouTube por la publicidad pasa mientras mirás las opciones.
+    // Preview más rápido: resolver por adelantado la opción bajo el mouse (a los 80 ms)
+    // y las primeras de cada búsqueda apenas aparecen (de a 3 a la vez). Así el link ya está
+    // listo, y cualquier espera que pida YouTube pasa mientras mirás las opciones.
     if (resultsVisible() && searchResult.state == grab::Searcher::Result::State::done && ! searchResult.items.empty()
         && engine.getToolStatus().installed)
     {
-        if (hoverRow >= 0 && now - hoverSince > 150)
+        if (hoverRow >= 0 && now - hoverSince > 80)
             prefetchItem (hoverRow);
 
         if (searchResult.generation != prefetchedGeneration)
         {
             if (resultsStableSince == 0)
                 resultsStableSince = juce::jmax ((juce::uint32) 1, now);
-            else if (now - resultsStableSince > 700)
+            else if (now - resultsStableSince > 150)
             {
                 prefetchedGeneration = searchResult.generation;
 
                 std::vector<std::pair<juce::String, juce::String>> first;
-                for (size_t i = 0; i < juce::jmin ((size_t) 4, searchResult.items.size()); ++i)
+                for (size_t i = 0; i < juce::jmin ((size_t) 6, searchResult.items.size()); ++i)
                     first.push_back ({ searchResult.items[i].videoId, searchResult.items[i].url() });
 
                 processorRef.preview.prefetchMany (first);

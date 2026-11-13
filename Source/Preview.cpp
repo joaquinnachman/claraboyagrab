@@ -146,9 +146,69 @@ juce::String PreviewPlayer::clipKey (const juce::String& videoId, double start, 
 }
 
 //==============================================================================
+//==============================================================================
+// Resuelven links por adelantado, de a varios a la vez, sin frenar al que reproduce.
+class PreviewPlayer::PrefetchWorker final : public juce::Thread
+{
+public:
+    PrefetchWorker (PreviewPlayer& o, int index)
+        : juce::Thread ("Claraboya Grab - adelantar " + juce::String (index)), owner (o) {}
+
+    void run() override
+    {
+        while (! threadShouldExit())
+        {
+            juce::String id, url;
+
+            {
+                const juce::ScopedLock sl (owner.lock);
+
+                while (! owner.prefetchQueue.empty() && id.isEmpty())
+                {
+                    auto next = owner.prefetchQueue.front();
+                    owner.prefetchQueue.erase (owner.prefetchQueue.begin());
+
+                    if (owner.prefetchInFlight.count (next.first) == 0)
+                    {
+                        id = next.first;
+                        url = next.second;
+                        owner.prefetchInFlight.insert (id);
+                    }
+                }
+            }
+
+            if (id.isEmpty())
+            {
+                wait (250);
+                continue;
+            }
+
+            owner.handlePrefetch (id, url, [this] { return threadShouldExit(); });
+
+            const juce::ScopedLock sl (owner.lock);
+            owner.prefetchInFlight.erase (id);
+        }
+    }
+
+private:
+    PreviewPlayer& owner;
+};
+
 PreviewPlayer::PreviewPlayer (Engine& e) : juce::Thread ("Claraboya Grab - preview"), engine (e)
 {
+    for (int i = 0; i < 3; ++i)
+    {
+        workers.push_back (std::make_unique<PrefetchWorker> (*this, i + 1));
+        workers.back()->startThread();
+    }
+
     startThread();
+}
+
+void PreviewPlayer::notifyWorkers()
+{
+    for (auto& w : workers)
+        w->notify();
 }
 
 std::shared_ptr<PreviewPlayer::Clip> PreviewPlayer::makeClip (const juce::String& key, double rate, double len) const
@@ -166,6 +226,12 @@ std::shared_ptr<PreviewPlayer::Clip> PreviewPlayer::makeClip (const juce::String
 
 PreviewPlayer::~PreviewPlayer()
 {
+    for (auto& w : workers)
+        w->signalThreadShouldExit();
+    notifyWorkers();
+    for (auto& w : workers)
+        w->stopThread (8000);   // sus yt-dlp se cortan solos al ver que hay que salir
+
     ++latestGen;
     signalThreadShouldExit();
     killCurrentProcess();
@@ -289,7 +355,7 @@ void PreviewPlayer::prefetch (const juce::String& videoId, const juce::String& u
             prefetchQueue.resize (8);
     }
 
-    notify();
+    notifyWorkers();
 }
 
 void PreviewPlayer::prefetchMany (const std::vector<std::pair<juce::String, juce::String>>& idsAndUrls)
@@ -297,7 +363,7 @@ void PreviewPlayer::prefetchMany (const std::vector<std::pair<juce::String, juce
     std::vector<std::pair<juce::String, juce::String>> todo;
 
     for (auto& p : idsAndUrls)
-        if (p.first.isNotEmpty() && p.second.isNotEmpty() && ! isResolved (p.first) && todo.size() < 8)
+        if (p.first.isNotEmpty() && p.second.isNotEmpty() && ! isResolved (p.first) && todo.size() < 10)
             todo.push_back (p);
 
     {
@@ -305,7 +371,7 @@ void PreviewPlayer::prefetchMany (const std::vector<std::pair<juce::String, juce
         prefetchQueue = std::move (todo);   // las de una búsqueda vieja ya no importan
     }
 
-    notify();
+    notifyWorkers();
 }
 
 bool PreviewPlayer::isResolved (const juce::String& videoId) const
@@ -469,7 +535,6 @@ void PreviewPlayer::run()
     {
         Request req;
         bool havePlay = false;
-        juce::String pid, purl;
 
         {
             const juce::ScopedLock sl (lock);
@@ -479,22 +544,12 @@ void PreviewPlayer::run()
                 hasPending = false;
                 havePlay = true;
             }
-            else if (! prefetchQueue.empty())
-            {
-                pid = prefetchQueue.front().first;
-                purl = prefetchQueue.front().second;
-                prefetchQueue.erase (prefetchQueue.begin());
-            }
         }
 
         if (havePlay)
         {
             if (! isStale (req.generation))
                 handlePlay (req);
-        }
-        else if (pid.isNotEmpty())
-        {
-            handlePrefetch (pid, purl);
         }
         else
         {
@@ -503,44 +558,51 @@ void PreviewPlayer::run()
     }
 }
 
-void PreviewPlayer::handlePrefetch (const juce::String& videoId, const juce::String& url)
+void PreviewPlayer::handlePrefetch (const juce::String& videoId, const juce::String& url,
+                                    const std::function<bool()>& cancelled)
 {
     const int level = forceSlowPath.load() ? 2 : pathLevel.load();
 
     if (level >= 2 || isResolved (videoId))
         return;   // con el plan B el link adelantado no se usa
 
-    const auto serial = killSerial.load();
-    const auto cancelled = [this, serial] { return threadShouldExit() || killSerial.load() != serial; };
-
-    {
-        const juce::ScopedLock pl (procLock);
-        inFlightResolveId = videoId;
-        inFlightIsPrefetch = true;
-    }
-
     Stream s;
     juce::String error;
     const auto t0 = tick();
-    const bool ok = resolve (videoId, url, level == 0, s, error, cancelled);
+    bool ok = false;
 
-    {
-        const juce::ScopedLock pl (procLock);
-        inFlightResolveId = {};
-        inFlightIsPrefetch = false;
-    }
+    // Igual que al tocar play: primero el cliente rápido; si no puede, el normal (así la espera
+    // por publicidad, si la hay, ya arranca a correr ahora y no cuando toques la tapa).
+    if (level == 0 && fastClientAllowed())
+        ok = resolve (videoId, url, true, s, error, cancelled, false);
+
+    if (! ok && ! cancelled())
+        ok = resolve (videoId, url, false, s, error, cancelled, false);
 
     if (ok)
-    {
-        log ("  (adelantado " + videoId + " en " + juce::String ((int) (tick() - t0)) + " ms"
+        log ("  (adelantado " + videoId + (s.fastClient ? " rapido" : " normal") + " en " + juce::String ((int) (tick() - t0)) + " ms"
              + (s.mustWaitUntil() > nowMs() ? ", YouTube pide esperar " + secondsFromNow (s.mustWaitUntil()) : juce::String()) + ")");
-    }
-    else if (cancelled() && ! threadShouldExit())
+    else if (! cancelled())
+        log ("  (no se pudo adelantar " + videoId + ": " + error + ")");
+}
+
+bool PreviewPlayer::waitForPrefetchOf (const juce::String& videoId, int generation)
+{
+    // Si justo se está adelantando este mismo link, se espera a ese (pedir otro reiniciaría la espera de YouTube).
+    const auto until = tick() + 30000;
+
+    for (;;)
     {
-        // Lo cortó un play de otra opción: vuelve a la fila, al final
-        const juce::ScopedLock sl (lock);
-        if (prefetchQueue.size() < 8)
-            prefetchQueue.push_back ({ videoId, url });
+        {
+            const juce::ScopedLock sl (lock);
+            if (prefetchInFlight.count (videoId) == 0)
+                return ! isStale (generation);
+        }
+
+        if (isStale (generation) || tick() > until)
+            return ! isStale (generation);
+
+        wait (20);
     }
 }
 
@@ -566,14 +628,19 @@ void PreviewPlayer::handlePlay (const Request& req)
 
     if (level < 2)
     {
-        // 1) El link del audio: el adelantado si está; si no, con el cliente rápido y, si ese no puede, el normal.
+        // 1) El link del audio: el adelantado si está (o se está adelantando); si no, con el cliente
+        //    rápido y, si ese no puede, el normal.
+        if (! waitForPrefetchOf (req.videoId, req.generation))
+            return;
+
         if (Stream c; level == 1 && cachedStream (req.videoId, c) && c.fastClient)
             forgetStream (req.videoId);
 
         Stream s;
         bool resolved = false;
+        const int firstAttempt = (level == 0 && (fastClientAllowed() || isResolved (req.videoId))) ? 0 : 1;
 
-        for (int attempt = level; attempt < 2 && ! resolved; ++attempt)
+        for (int attempt = firstAttempt; attempt < 2 && ! resolved; ++attempt)
         {
             const bool fast = attempt == 0;
 
@@ -699,7 +766,7 @@ bool PreviewPlayer::waitUntilAvailable (const Request& req, juce::int64 untilMs)
 }
 
 bool PreviewPlayer::resolve (const juce::String& videoId, const juce::String& url, bool fastClient, Stream& out,
-                             juce::String& error, const std::function<bool()>& isStaleFn)
+                             juce::String& error, const std::function<bool()>& isStaleFn, bool killable)
 {
     if (cachedStream (videoId, out))
         return true;
@@ -716,12 +783,14 @@ bool PreviewPlayer::resolve (const juce::String& videoId, const juce::String& ur
     if (auto deno = Tools::deno(); deno.existsAsFile())
         a.addArray (juce::StringArray { "--js-runtimes", "deno:" + deno.getFullPathName() });
 
-    if (engine.getUseFirefoxCookies())
+    // El cliente rápido no acepta sesión (yt-dlp lo saltea si se le pasan cookies), y leer las de
+    // Firefox tarda: va sin sesión. Si YouTube la pide, el cliente normal la usa.
+    if (engine.getUseFirefoxCookies() && ! fastClient)
         a.addArray (juce::StringArray { "--cookies-from-browser", "firefox" });
 
     a.addArray (engine.getExtraYtdlpArgs());
 
-    // Cliente de YouTube que no necesita resolver el JavaScript del reproductor: una sola consulta, sin Deno.
+    // Cliente de YouTube sin JavaScript ni publicidad: una sola consulta, sin Deno y sin espera.
     if (fastClient)
         a.addArray (juce::StringArray { "--extractor-args", "youtube:player_client=visionos;player_skip=webpage,configs" });
 
@@ -735,14 +804,23 @@ bool PreviewPlayer::resolve (const juce::String& videoId, const juce::String& ur
         if (l.startsWith ("ERROR:"))
             lastError = l.substring (6).trim();
         lines.add (l);
-    });
+    }, killable);
 
     Stream s;
     if (code != 0 || ! parseResolveOutput (lines, s))
     {
         error = isStaleFn() ? juce::String() : (code == -2000 ? TR ("tardó demasiado.") : Engine::friendlyError (lastError));
+
+        if (fastClient && ! isStaleFn())
+        {
+            if (++fastResolveFailures == 3)
+                log ("  el cliente rapido fallo 3 veces seguidas (" + lastError.substring (0, 160) + "): en esta sesion se usa el normal");
+        }
         return false;
     }
+
+    if (fastClient)
+        fastResolveFailures = 0;
 
     s.fastClient = fastClient;
 
@@ -1110,13 +1188,14 @@ void PreviewPlayer::forgetStream (const juce::String& videoId)
 }
 
 int PreviewPlayer::runTool (const juce::StringArray& args, const std::function<bool()>& isStaleFn, int timeoutMs,
-                            const std::function<void (const juce::String&)>& onLine)
+                            const std::function<void (const juce::String&)>& onLine, bool killable)
 {
     juce::ChildProcess proc;
 
     if (! proc.start (args, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
         return -1000;
 
+    if (killable)
     {
         const juce::ScopedLock sl (procLock);
         currentProc = &proc;
@@ -1168,6 +1247,7 @@ int PreviewPlayer::runTool (const juce::StringArray& args, const std::function<b
 
     emit();
 
+    if (killable)
     {
         const juce::ScopedLock sl (procLock);
         currentProc = nullptr;

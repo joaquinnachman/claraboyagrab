@@ -90,6 +90,7 @@ if(CLARABOYA_BUILD_TESTS)
     juce_add_console_app(ClaraboyaGrabTests PRODUCT_NAME "ClaraboyaGrabTests" NEEDS_CURL TRUE)
     target_sources(ClaraboyaGrabTests PRIVATE ${GRAB_ENGINE_SOURCES} Tests/TestMain.cpp)
     target_include_directories(ClaraboyaGrabTests PRIVATE Source)
+    target_compile_options(ClaraboyaGrabTests PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
     target_compile_definitions(ClaraboyaGrabTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_USE_CURL=1
@@ -107,6 +108,7 @@ if(CLARABOYA_BUILD_TESTS)
     target_sources(ClaraboyaGrabSnapshot PRIVATE ${GRAB_ENGINE_SOURCES}
         Source/PluginProcessor.cpp Source/PluginEditor.cpp Tests/Snapshot.cpp)
     target_include_directories(ClaraboyaGrabSnapshot PRIVATE Source)
+    target_compile_options(ClaraboyaGrabSnapshot PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
     target_compile_definitions(ClaraboyaGrabSnapshot PRIVATE
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=1 JUCE_STANDALONE_APPLICATION=1 JUCE_MODAL_LOOPS_PERMITTED=1)
     target_link_libraries(ClaraboyaGrabSnapshot PRIVATE

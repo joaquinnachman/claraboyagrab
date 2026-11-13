@@ -13,11 +13,17 @@
 /*  Preview: escuchar ~30 s de una opción antes de bajarla, rápido.
 
     1. yt-dlp solo resuelve el link del audio (con un cliente de YouTube que no necesita
-       JavaScript; si falla, el de siempre). Ese link se guarda unas horas y se puede pedir
-       por adelantado (al pasar el mouse por la tapa o con la primera opción).
-    2. FFmpeg arranca directo en el 30 % del tema y manda el audio decodificado al reproductor
+       JavaScript; si falla, el de siempre). Ese link se guarda unas horas y se pide por
+       adelantado para las primeras opciones y la que está bajo el mouse.
+    2. Si el tema tiene publicidad al principio, YouTube no deja usar el link hasta que
+       "pasaría" el anuncio (available_at): se espera ese tiempo, y como el link se pidió
+       por adelantado, normalmente la espera ya pasó cuando tocás play.
+    3. FFmpeg arranca directo en el 30 % del tema y manda el audio decodificado al reproductor
        a medida que llega: suena apenas hay medio segundo, sin esperar los 30 s.
-    3. El volumen se empareja con una ganancia liviana (por RMS) mientras suena.
+    4. Plan B: si por ese camino no llega audio, yt-dlp baja solo el fragmento (como la 1.3).
+    5. El volumen se empareja con una ganancia liviana (por RMS) mientras suena.
+
+    Lo que pasa queda anotado en %APPDATA%\Claraboya Grab\preview-log.txt.
 
     Suena sumado a la salida del canal del plugin, o por la salida de Windows en la app suelta.
 */
@@ -38,14 +44,27 @@ namespace grab
             double startSec = 0.0, lengthSec = 0.0;
             juce::String error;
             bool stalled = false;           // "suena" pero nadie lo está reproduciendo (canal dormido)
+            juce::int64 waitUntilMs = 0;    // YouTube pide esperar hasta esta hora (ms desde 1970)
+            bool slowPath = false;          // usando el plan B
         };
 
         /** Link del audio ya resuelto por yt-dlp. */
         struct Stream
         {
             juce::String url, userAgent;
-            juce::int64 resolvedAt = 0;     // ms
+            juce::StringPairArray headers;  // los que usa yt-dlp para ese link
+            juce::int64 resolvedAt = 0;     // ms desde 1970
+            juce::int64 availableAt = 0;    // ms desde 1970: antes de esto YouTube rechaza el link (0 = ya)
             bool fastClient = false;        // resuelto con el cliente sin JavaScript
+
+            /** Hasta cuándo hay que esperar (0 si no hace falta). */
+            juce::int64 mustWaitUntil() const noexcept
+            {
+                return availableAt > resolvedAt ? availableAt + 1000 : 0;   // +1 s: available_at viene en segundos enteros
+            }
+
+            /** Los headers como los pasa yt-dlp a FFmpeg ("Clave: valor\r\n" cada uno). */
+            juce::String headerBlock() const;
         };
 
         explicit PreviewPlayer (Engine&);
@@ -54,8 +73,10 @@ namespace grab
         void play (const juce::String& videoId, const juce::String& url, const juce::String& title, double durationSec);
         void stop();
 
-        /** Resolver el link por adelantado (no suena nada). */
+        /** Resolver el link por adelantado (no suena nada). Este va primero en la fila. */
         void prefetch (const juce::String& videoId, const juce::String& url);
+        /** Varias opciones por adelantado, en orden (reemplaza las que todavía no se resolvieron). */
+        void prefetchMany (const std::vector<std::pair<juce::String, juce::String>>& idsAndUrls);
         bool isResolved (const juce::String& videoId) const;
 
         Status getStatus() const;
@@ -81,6 +102,12 @@ namespace grab
         static double chooseStart (double durationSec);
         static float gainForRms (float rms) noexcept;
         static bool parseResolveOutput (const juce::StringArray& lines, Stream& out);
+        static juce::String formatSeconds (double seconds);   // "88.000", siempre con punto
+        static juce::File logFile();
+
+        /** Solo para pruebas: usar directo el plan B. */
+        void setForceSlowPathForTesting (bool b) noexcept { forceSlowPath = b; }
+        int getPathLevel() const noexcept { return pathLevel.load(); }
 
     private:
         struct Request
@@ -110,7 +137,14 @@ namespace grab
         void handlePrefetch (const juce::String& videoId, const juce::String& url);
         bool resolve (const juce::String& videoId, const juce::String& url, bool fastClient, Stream& out,
                       juce::String& error, const std::function<bool()>& isStale);
-        bool streamInto (const Request&, const Stream&, const std::shared_ptr<Clip>&, juce::String& error);
+        bool waitUntilAvailable (const Request&, juce::int64 untilMs);
+        bool streamInto (const Request&, const juce::String& input, const juce::String& headerBlock,
+                         double startSec, const std::shared_ptr<Clip>&, juce::String& error);
+        juce::String probeError (const juce::String& input, const juce::String& headerBlock, double startSec,
+                                 const std::function<bool()>& isStale);
+        bool loadSection (const Request&, const std::shared_ptr<Clip>&, juce::String& error);
+        std::shared_ptr<Clip> makeClip (const juce::String& key, double rate, double len) const;
+        static void log (const juce::String&);
         void startPlaying (const std::shared_ptr<Clip>&, int generation);
         int runTool (const juce::StringArray& args, const std::function<bool()>& isStale, int timeoutMs,
                      const std::function<void (const juce::String&)>& onLine);
@@ -128,7 +162,7 @@ namespace grab
         mutable juce::CriticalSection lock;
         Request pending;
         bool hasPending = false;
-        juce::String prefetchId, prefetchUrl;
+        std::vector<std::pair<juce::String, juce::String>> prefetchQueue;   // id, link
         Status status;
         std::atomic<int> latestGen { 0 };
         std::atomic<juce::uint32> revision { 1 };
@@ -155,6 +189,11 @@ namespace grab
         std::atomic<float> progress { 0.0f };
         std::atomic<juce::uint32> lastRenderMs { 0 };
         std::atomic<juce::uint32> playStartedMs { 0 };
+
+        // Camino que se usa en esta sesión: 0 = link con el cliente rápido, 1 = link con el cliente
+        // normal, 2 = plan B directo. Baja un escalón cuando uno falla y el plan B sí anda.
+        std::atomic<int> pathLevel { 0 };
+        std::atomic<bool> forceSlowPath { false };
 
         bool hasTestStatus = false;
         Status testStatus;

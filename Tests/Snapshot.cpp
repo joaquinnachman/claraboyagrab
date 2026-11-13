@@ -128,6 +128,11 @@ int main (int argc, char** argv)
         p.preview.setStatusForTesting (ps);
         pump (400);
         save (*ed, outDir.getChildFile ("5-cargando-preview.png"));
+
+        ps.waitUntilMs = juce::Time::currentTimeMillis() + 5600;
+        p.preview.setStatusForTesting (ps);
+        pump (400);
+        save (*ed, outDir.getChildFile ("5b-esperando-youtube.png"));
     }
 
     // 3) Buscando, y la app sin herramientas

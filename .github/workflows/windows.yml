@@ -29,6 +29,30 @@ jobs:
       - name: Compilar VST3 + app suelta
         run: cmake --build build --config Release --target ClaraboyaGrab_VST3 ClaraboyaGrab_Standalone
 
+      # Las pruebas del motor también en Windows (preview, descargas, aviso de versión), con las
+      # herramientas instaladas por el mismo código que el botón INSTALAR. Si fallan, no se publica.
+      - name: Pruebas en Windows
+        shell: pwsh
+        run: |
+          cmake -B build-pruebas -A x64 -DCLARABOYA_BUILD_TESTS=ON
+          cmake --build build-pruebas --config Release --target ClaraboyaGrabTests
+          $exe = Get-ChildItem -Recurse build-pruebas -Filter ClaraboyaGrabTests.exe | Select-Object -First 1
+          & $exe.FullName --instalar
+          $code = $LASTEXITCODE
+          Write-Host "`n---- preview-log.txt ----"
+          Get-Content "$env:APPDATA\Claraboya Grab\preview-log.txt" -Tail 80 -ErrorAction SilentlyContinue
+          exit $code
+
+      # Contra YouTube de verdad desde Windows: informativo (YouTube suele bloquear a los servidores de GitHub).
+      - name: Preview real desde Windows (informativo)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse build-pruebas -Filter ClaraboyaGrabTests.exe | Select-Object -First 1
+          & $exe.FullName --solo-vivo --live
+          Write-Host "`n---- preview-log.txt ----"
+          Get-Content "$env:APPDATA\Claraboya Grab\preview-log.txt" -Tail 40 -ErrorAction SilentlyContinue
+
       - name: Armar el instalador
         shell: pwsh
         run: |

@@ -1,6 +1,7 @@
 // Pruebas del motor (sin interfaz). Solo para desarrollo: cmake -DCLARABOYA_BUILD_TESTS=ON
 //   ClaraboyaGrabTests          pruebas sin internet
 //   ClaraboyaGrabTests --live   además prueba contra Spotify y YouTube Music de verdad
+//   ClaraboyaGrabTests --instalar   primero instala yt-dlp/FFmpeg/Deno como el botón INSTALAR (Windows)
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
 #include <juce_graphics/juce_graphics.h>
@@ -50,6 +51,22 @@ static juce::String httpGet (const juce::String& url)
     if (auto in = juce::URL::createWithoutParsing (url).createInputStream (opts))
         return in->readEntireStreamAsString();
     return {};
+}
+
+// file:///... que entienden yt-dlp y FFmpeg en Linux, Mac y Windows (file:///C:/Users/...)
+static juce::String fileUrl (const juce::File& f)
+{
+    juce::StringArray parts;
+    parts.addTokens (f.getFullPathName().replaceCharacter ('\\', '/'), "/", {});
+
+    juce::String out;
+    for (int i = 0; i < parts.size(); ++i)
+    {
+        if (i > 0) out << "/";
+        out << (i == 0 && parts[i].endsWithChar (':') ? parts[i] : juce::URL::addEscapeChars (parts[i], false, true));
+    }
+
+    return out.startsWithChar ('/') ? "file://" + out : "file:///" + out;
 }
 
 static void printCandidates (const std::vector<Candidate>& items, int max = 6)
@@ -240,8 +257,7 @@ static void pipelineTest()
     e.setSampleRate (48000.0);
     e.setExtraYtdlpArgs ({ "--enable-file-urls" });
     e.clearList();
-    e.enqueueDownload ("file://" + juce::URL::addEscapeChars (tone.getFullPathName(), false, true).replace ("%2F", "/"),
-                       TR ("Tema de Prueba"), TR ("Los Ñandúes"));
+    e.enqueueDownload (fileUrl (tone), TR ("Tema de Prueba"), TR ("Los Ñandúes"));
     check (e.waitUntilIdle (90000), "terminó a tiempo");
 
     check (e.getJobs().empty(), "la descarga terminada sale de la cola");
@@ -293,16 +309,60 @@ static float rms (const juce::AudioBuffer<float>& b)
     return b.getRMSLevel (0, 0, b.getNumSamples());
 }
 
-static bool waitForPreview (PreviewPlayer& pp, int timeoutMs)
+static bool waitForPreview (PreviewPlayer& pp, int timeoutMs, juce::int64* sawWaitUntil = nullptr, bool* sawSlowPath = nullptr)
 {
     for (int i = 0; i < timeoutMs / 50; ++i)
     {
-        const auto st = pp.getStatus().state;
-        if (st == PreviewPlayer::State::playing || st == PreviewPlayer::State::failed)
+        const auto st = pp.getStatus();
+        if (sawWaitUntil != nullptr && st.waitUntilMs > *sawWaitUntil) *sawWaitUntil = st.waitUntilMs;
+        if (sawSlowPath != nullptr && st.slowPath) *sawSlowPath = true;
+        if (st.state == PreviewPlayer::State::playing || st.state == PreviewPlayer::State::failed)
             return true;
         juce::Thread::sleep (50);
     }
     return false;
+}
+
+static juce::String pythonExe()
+{
+   #if JUCE_WINDOWS
+    return "python";
+   #else
+    return "python3";
+   #endif
+}
+
+// Servidor HTTP de prueba: sirve una carpeta y, si se le pide (/negar?n=N), rechaza con 403 los
+// próximos N pedidos de FFmpeg, como hace YouTube cuando el link se usa antes de tiempo.
+static const char* testServerPy = R"PY(
+import functools, http.server, io, sys, urllib.parse
+port, root = int(sys.argv[1]), sys.argv[2]
+state = {'deny': 0}
+class H(http.server.SimpleHTTPRequestHandler):
+    def send_head(self):
+        u = urllib.parse.urlparse(self.path)
+        if u.path == '/negar':
+            state['deny'] = int(urllib.parse.parse_qs(u.query).get('n', ['0'])[0])
+            self.send_response(200)
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+            return io.BytesIO(b'ok')
+        if self.headers.get('Icy-MetaData') and state['deny'] > 0:
+            state['deny'] -= 1
+            self.send_error(403, 'Forbidden')
+            return None
+        return super().send_head()
+    def log_message(self, *a):
+        pass
+http.server.ThreadingHTTPServer(('127.0.0.1', port), functools.partial(H, directory=root)).serve_forever()
+)PY";
+
+static juce::String logSince (juce::int64 sizeBefore)
+{
+    auto in = PreviewPlayer::logFile().createInputStream();
+    if (in == nullptr) return {};
+    if (sizeBefore > 0 && sizeBefore <= in->getTotalLength()) in->setPosition (sizeBefore);
+    return in->readEntireStreamAsString();
 }
 
 static void previewTest()
@@ -313,6 +373,8 @@ static void previewTest()
     check (PreviewPlayer::chooseStart (0.0) == 0.0, "sin duración: desde el principio");
     check (std::abs (PreviewPlayer::gainForRms (0.3f) - 0.4333f) < 0.001f, "un master fuerte se baja (~ -7 dB)");
     check (PreviewPlayer::gainForRms (0.01f) == 2.0f && PreviewPlayer::gainForRms (0.0f) == 1.0f, "nunca sube más de +6 dB ni amplifica silencio");
+    eq (PreviewPlayer::formatSeconds (88.0), "88.000", "segundos para FFmpeg siempre con punto");
+    eq (PreviewPlayer::formatSeconds (29.9876), "29.988", "redondeo a milisegundos");
 
     {
         PreviewPlayer::Stream st;
@@ -321,6 +383,22 @@ static void previewTest()
                && st.url == "https://rr1.googlevideo.com/x?y=1" && st.userAgent == "Mozilla/5.0 Prueba", "lee el link y el user-agent");
         check (PreviewPlayer::parseResolveOutput ({ "URL|https://a/b", "UA|NA" }, st) && st.userAgent.isEmpty(), "sin user-agent");
         check (! PreviewPlayer::parseResolveOutput ({ "ERROR: algo" }, st), "sin link = falla");
+
+        // Headers de yt-dlp y la espera que pide YouTube por la publicidad
+        const auto nowSec = juce::Time::currentTimeMillis() / 1000;
+        check (PreviewPlayer::parseResolveOutput ({ "URL|https://a/b", "UA|Mozilla/5.0 X",
+                                                    R"(HDR|{"User-Agent": "Mozilla/5.0 X", "Accept-Language": "en-us,en;q=0.5", "Sec-Fetch-Mode": "navigate"})",
+                                                    "AT|" + juce::String (nowSec + 6) }, st), "lee headers y available_at");
+        eq (st.headerBlock(), "User-Agent: Mozilla/5.0 X\r\nAccept-Language: en-us,en;q=0.5\r\nSec-Fetch-Mode: navigate\r\n",
+            "headers como los pasa yt-dlp a FFmpeg");
+        const auto wait = st.mustWaitUntil() - juce::Time::currentTimeMillis();
+        check (wait > 5000 && wait <= 8000, "con publicidad: espera ~6 s + 1 de margen", juce::String (wait));
+
+        check (PreviewPlayer::parseResolveOutput ({ "URL|https://a/b", "AT|" + juce::String (nowSec - 1) }, st)
+               && st.mustWaitUntil() == 0, "sin publicidad: no espera nada");
+        check (PreviewPlayer::parseResolveOutput ({ "URL|https://a/b", "AT|NA" }, st) && st.mustWaitUntil() == 0, "sin dato: no espera");
+        check (PreviewPlayer::parseResolveOutput ({ "URL|https://a/b", "UA|Mozilla/5.0 Solo" }, st)
+               && st.headerBlock() == "User-Agent: Mozilla/5.0 Solo\r\n", "sin headers: al menos el user-agent");
     }
 
     if (! Tools::allInstalled())
@@ -332,27 +410,42 @@ static void previewTest()
     auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
                    .getChildFile ("grabpreview_" + juce::String (juce::Random::getSystemRandom().nextInt (999999)));
     tmp.createDirectory();
-    auto tone = tmp.getChildFile (TR ("tono largo ñ.mp3"));
+    auto tone = tmp.getChildFile ("tono largo.mp3");
     run ({ Tools::ffmpeg().getFullPathName(), "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=330:duration=60",
            "-ar", "44100", "-ac", "2", "-c:a", "libmp3lame", "-b:a", "128k", tone.getFullPathName() });
     auto big = tmp.getChildFile ("largo.webm");
     run ({ Tools::ffmpeg().getFullPathName(), "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=220:duration=300",
            "-ar", "48000", "-ac", "2", "-c:a", "libopus", "-b:a", "128k", big.getFullPathName() });
+    check (tone.getSize() > 10000 && big.getSize() > 10000, "archivos de prueba");
+
+    // Todo por HTTP, como YouTube (y anda igual en Windows y en Linux)
+    auto script = tmp.getChildFile ("servidor.py");
+    script.replaceWithText (testServerPy);
+    juce::ChildProcess server;
+    const int port = 18000 + juce::Random::getSystemRandom().nextInt (2000);
+    const auto base = "http://127.0.0.1:" + juce::String (port) + "/";
+    check (server.start (juce::StringArray { pythonExe(), script.getFullPathName(), juce::String (port), tmp.getFullPathName() }),
+           "servidor de prueba (python)");
+    for (int i = 0; i < 100 && httpGet (base + "negar?n=0") != "ok"; ++i)
+        juce::Thread::sleep (100);
+    check (httpGet (base + "negar?n=0") == "ok", "servidor de prueba responde");
+
+    const auto toneUrl = base + "tono%20largo.mp3";
+    const auto bigUrl = base + "largo.webm";
 
     Engine e;
-    e.setExtraYtdlpArgs ({ "--enable-file-urls" });
     PreviewPlayer pp (e);
     pp.setPlaybackRate (48000.0);
 
-    const auto fileUrl = "file://" + juce::URL::addEscapeChars (tone.getFullPathName(), false, true).replace ("%2F", "/");
-    pp.play ("tono-prueba", fileUrl, "Tono de prueba", 60.0);
+    pp.play ("tono-prueba", toneUrl, "Tono de prueba", 60.0);
     check (pp.getStatus().state == PreviewPlayer::State::loading, "arranca cargando");
     check (waitForPreview (pp, 60000), "carga a tiempo");
 
     auto st = pp.getStatus();
-    std::cout << "      archivo local: suena a los " << pp.getLastTimeToSoundMs() << " ms"
+    std::cout << "      tono: suena a los " << pp.getLastTimeToSoundMs() << " ms"
               << (st.error.isNotEmpty() ? "  error: " + st.error : juce::String()) << "\n";
     check (st.state == PreviewPlayer::State::playing, "suena", st.error);
+    check (! st.slowPath, "por el camino rápido");
     check (st.startSec == 18.0 && st.lengthSec == 30.0, "fragmento de 30 s desde el 30 %");
 
     juce::Thread::sleep (1500);   // que termine de llegar el audio (en la vida real se va reproduciendo)
@@ -384,7 +477,7 @@ static void previewTest()
     pp.render (fade, 0, 4800);
     check (rms (fade) == 0.0f && pp.getStatus().state == PreviewPlayer::State::idle, "parar = silencio");
 
-    pp.play ("tono-prueba", fileUrl, "Tono de prueba", 60.0);
+    pp.play ("tono-prueba", toneUrl, "Tono de prueba", 60.0);
     check (pp.getStatus().state == PreviewPlayer::State::playing && pp.getLastTimeToSoundMs() == 0,
            "la segunda vez suena al instante (desde la memoria)");
 
@@ -396,27 +489,20 @@ static void previewTest()
     }
     check (pp.getStatus().state == PreviewPlayer::State::idle, "al terminar el fragmento se apaga solo");
 
-    // Por HTTP (como YouTube): antes vs ahora
+    // Antes vs ahora
     {
-        juce::ChildProcess server;
-        const int port = 18000 + juce::Random::getSystemRandom().nextInt (2000);
-        server.start (juce::StringArray { "python3", "-m", "http.server", juce::String (port), "--bind", "127.0.0.1",
-                                          "--directory", tmp.getFullPathName() });
-        juce::Thread::sleep (1200);
-        const auto url = "http://127.0.0.1:" + juce::String (port) + "/largo.webm";
-
-        // Método anterior: fragmento con yt-dlp --download-sections + FFmpeg con loudnorm, y recién ahí suena
+        // Método 1.3: fragmento con yt-dlp --download-sections + FFmpeg con loudnorm, y recién ahí suena
         auto t0 = juce::Time::getMillisecondCounter();
         auto old = tmp.getChildFile ("viejo");
         old.createDirectory();
         run ({ Tools::ytdlp().getFullPathName(), "--no-warnings", "-f", "bestaudio/best", "--download-sections", "*90-120",
-               "-o", old.getFullPathName() + "/x.%(ext)s", "--", url });
+               "-o", old.getFullPathName() + "/x.%(ext)s", "--", bigUrl });
         auto section = old.findChildFiles (juce::File::findFiles, false);
         run ({ Tools::ffmpeg().getFullPathName(), "-v", "error", "-y", "-i", section.isEmpty() ? juce::String() : section[0].getFullPathName(),
                "-ac", "2", "-ar", "48000", "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-c:a", "pcm_f32le", old.getFullPathName() + "/x.wav" });
         const auto oldMs = (int) (juce::Time::getMillisecondCounter() - t0);
 
-        pp.play ("http-largo", url, "Largo", 300.0);
+        pp.play ("http-largo", bigUrl, "Largo", 300.0);
         waitForPreview (pp, 60000);
         st = pp.getStatus();
         const auto newMs = pp.getLastTimeToSoundMs();
@@ -430,35 +516,97 @@ static void previewTest()
         check (rms (buf) > 0.06f, "fragmento con audio");
         pp.stop();
 
-        // Con el link resuelto por adelantado (al pasar el mouse por la tapa)
-        pp.prefetch ("http-adelantado", url);
-        for (int i = 0; i < 300 && ! pp.isResolved ("http-adelantado"); ++i)
+        // Con los links resueltos por adelantado (las primeras opciones de la búsqueda)
+        pp.prefetchMany ({ { "adelantado-1", bigUrl + "?a=1" }, { "adelantado-2", bigUrl + "?a=2" } });
+        for (int i = 0; i < 400 && ! (pp.isResolved ("adelantado-1") && pp.isResolved ("adelantado-2")); ++i)
             juce::Thread::sleep (50);
-        check (pp.isResolved ("http-adelantado"), "resuelve el link por adelantado");
-        pp.play ("http-adelantado", url, "Largo", 300.0);
+        check (pp.isResolved ("adelantado-1") && pp.isResolved ("adelantado-2"), "resuelve por adelantado las primeras opciones");
+        pp.play ("adelantado-2", bigUrl + "?a=2", "Largo", 300.0);
         waitForPreview (pp, 60000);
         std::cout << "      con el link adelantado suena a los " << pp.getLastTimeToSoundMs() << " ms\n";
         check (pp.getStatus().state == PreviewPlayer::State::playing && pp.getLastTimeToSoundMs() < newMs,
                "con el link adelantado suena todavía antes");
         pp.stop();
-        server.kill();
+    }
+
+    // YouTube: si el tema tiene publicidad, el link no se puede usar hasta que "pasaría" el anuncio
+    {
+        Engine ew;
+        const auto at = juce::Time::currentTimeMillis() / 1000 + 4;
+        ew.setExtraYtdlpArgs ({ "--parse-metadata", "t=" + juce::String (at) + ":t=(?P<available_at>\\d+)" });
+        PreviewPlayer pw (ew);
+        pw.setPlaybackRate (48000.0);
+        juce::int64 sawWait = 0;
+        pw.play ("con-publicidad", bigUrl + "?p=1", "Con publicidad", 300.0);
+        waitForPreview (pw, 60000, &sawWait);
+        const auto stw = pw.getStatus();
+        std::cout << "      con publicidad: suena a los " << pw.getLastTimeToSoundMs() << " ms\n";
+        check (stw.state == PreviewPlayer::State::playing, "con publicidad: suena", stw.error);
+        check (sawWait >= (at + 1) * 1000 - 50, "muestra la cuenta regresiva hasta que YouTube deja", juce::String (sawWait - at * 1000));
+        check (juce::Time::currentTimeMillis() >= (at + 1) * 1000 - 50, "no abre el link antes de tiempo");
+        pw.stop();
+    }
+
+    // Si FFmpeg recibe 403 (YouTube hizo esperar sin avisar): reintenta a los 5 s con el mismo link
+    {
+        const auto logBefore = PreviewPlayer::logFile().getSize();
+        httpGet (base + "negar?n=2");   // el primer intento y la prueba de diagnóstico
+        pp.play ("con-403", bigUrl + "?r=1", "Con 403", 300.0);
+        bool slow = false;
+        waitForPreview (pp, 60000, nullptr, &slow);
+        st = pp.getStatus();
+        const auto log = logSince (logBefore);
+        std::cout << "      con 403: suena a los " << pp.getLastTimeToSoundMs() << " ms\n";
+        check (st.state == PreviewPlayer::State::playing && ! slow, "con 403 al principio: suena al reintentar", st.error);
+        check (log.contains ("403") && log.contains ("reintento"), "queda anotado en preview-log.txt", log.getLastCharacters (300));
+        check (pp.getPathLevel() == 0, "un 403 suelto no cambia el camino");
+        pp.stop();
+    }
+
+    // Plan B: si por el camino rápido no llega audio, yt-dlp baja el fragmento (como la 1.3)
+    {
+        Engine eb;
+        PreviewPlayer pb (eb);
+        pb.setPlaybackRate (48000.0);
+        httpGet (base + "negar?n=4");   // intento, diagnóstico, reintento, diagnóstico: todo 403
+        bool slow = false;
+        pb.play ("plan-b", bigUrl + "?b=1", "Plan B", 300.0);
+        waitForPreview (pb, 90000, nullptr, &slow);
+        auto sb = pb.getStatus();
+        std::cout << "      plan B: suena a los " << pb.getLastTimeToSoundMs() << " ms\n";
+        check (sb.state == PreviewPlayer::State::playing && slow, "si el link directo no anda, suena por el plan B", sb.error);
+        juce::Thread::sleep (1500);
+        buf.clear();
+        pb.render (buf, 0, 48000);
+        check (rms (buf) > 0.06f, "plan B: fragmento con audio");
+        check (pb.getPathLevel() == 1, "la próxima vez prueba con el cliente normal", juce::String (pb.getPathLevel()));
+        pb.stop();
+
+        pb.setForceSlowPathForTesting (true);
+        slow = false;
+        pb.play ("plan-b-directo", toneUrl + "?b=2", "Plan B directo", 60.0);
+        waitForPreview (pb, 90000, nullptr, &slow);
+        sb = pb.getStatus();
+        check (sb.state == PreviewPlayer::State::playing && slow && sb.startSec == 18.0, "plan B directo (mp3 desde el 30 %)", sb.error);
+        pb.stop();
     }
 
     // Uno que no existe
-    pp.play ("roto", "file:///no/existe.mp3", "Roto", 100.0);
-    waitForPreview (pp, 60000);
+    pp.play ("roto", base + "no-existe.mp3", "Roto", 100.0);
+    waitForPreview (pp, 90000);
     st = pp.getStatus();
     check (st.state == PreviewPlayer::State::failed && st.error.isNotEmpty(), "un link roto avisa el error", st.error);
     std::cout << "      mensaje: " << st.error << "\n";
 
     // Cambiar de opción mientras carga: gana la última
-    pp.play ("roto2", "file:///no/existe2.mp3", "Roto 2", 100.0);
-    pp.play ("tono-otro", fileUrl, "Tono", 60.0);
-    waitForPreview (pp, 20000);
+    pp.play ("roto2", base + "no-existe2.mp3", "Roto 2", 100.0);
+    pp.play ("tono-otro", toneUrl + "?o=1", "Tono", 60.0);
+    waitForPreview (pp, 30000);
     check (pp.getStatus().videoId == "tono-otro" && pp.getStatus().state == PreviewPlayer::State::playing,
            "si cambiás de opción rápido, suena la última");
     pp.stop();
 
+    server.kill();
     tmp.deleteRecursively();
 }
 
@@ -734,12 +882,32 @@ int main (int argc, char** argv)
 {
     juce::MessageManager::getInstance();
 
-    const bool live = argc > 1 && juce::String (argv[1]) == "--live";
+    juce::StringArray args;
+    for (int i = 1; i < argc; ++i)
+        args.add (argv[i]);
 
-    offlineTests();
-    pipelineTest();
-    previewTest();
-    updaterTest();
+    const bool live = args.contains ("--live");
+
+    // En Windows (CI): instalar yt-dlp, FFmpeg y Deno con el mismo código que el botón INSTALAR.
+    if (args.contains ("--instalar") && ! Tools::allInstalled())
+    {
+        std::cout << "\n== Instalar herramientas (como el botón INSTALAR)\n";
+        Engine e;
+        e.enqueueInstallTools (false);
+        e.waitUntilIdle (1200000);
+        const auto ts = e.getToolStatus();
+        std::cout << "      " << ts.text << "  (yt-dlp " << ts.version << ")\n";
+        check (Tools::allInstalled(), "yt-dlp, FFmpeg y Deno instalados", ts.text);
+        check (Tools::ytdlpIsFastBuild(), "yt-dlp en carpeta (arranca rápido)");
+    }
+
+    if (! args.contains ("--solo-vivo"))
+    {
+        offlineTests();
+        pipelineTest();
+        previewTest();
+        updaterTest();
+    }
 
     const int offlineFailures = failures;
 

@@ -5,7 +5,7 @@ Plugin VST3 para Cubase (Windows). Pegás un link, lo baja como WAV a la frecuen
 - **Directo:** YouTube, YouTube Music, SoundCloud, Bandcamp, Vimeo, Instagram, TikTok, Facebook, Mixcloud y todo lo que soporta yt-dlp. Pegás el link y baja.
 - **Spotify, Apple Music, Deezer, TIDAL, Amazon Music:** el audio de esas plataformas viene cifrado, así que no se baja de ahí. El plugin lee qué tema es (artista, título, duración) y te muestra **opciones de YouTube Music** para que elijas cuál bajar. Arriba quedan las más parecidas y la que dura lo mismo que el original lleva la marca **MISMA DURACIÓN**.
 - **Texto:** escribí "artista tema" y mientras escribís aparecen las opciones (con tapa, disco y duración). Pestañas **CANCIONES** (audio de estudio) y **VIDEOS** (videoclips, vivos, etc.).
-- **Preview:** tocá la tapa de una opción para escuchar 30 s (desde el 30 % del tema, nivelado en volumen para comparar parejo). Suena mientras baja, y si pasaste el mouse por la tapa (o es la primera opción) arranca casi al instante. Tocala de nuevo para parar. En Cubase suena por el canal donde está el plugin; en la app suelta, por la salida de audio de Windows.
+- **Preview:** tocá la tapa de una opción para escuchar 30 s (desde el 30 % del tema, nivelado en volumen para comparar parejo). Suena mientras baja; las primeras opciones (y la que tenga el mouse encima) se preparan solas mientras mirás la lista, así arranca casi al instante. Si el tema tiene publicidad, YouTube hace esperar unos segundos antes de dejarlo escuchar: la app lo muestra con una cuenta regresiva. Tocala de nuevo para parar. En Cubase suena por el canal donde está el plugin; en la app suelta, por la salida de audio de Windows.
 - Podés pegar varios links a la vez (uno por línea): los directos bajan solos y los de Spotify/texto te los va mostrando de a uno ("TEMA 1 DE 3", con **SALTEAR**).
 
 No toca el audio del canal donde lo pongas: es solo la ventana del bajador.
@@ -44,6 +44,7 @@ Cada cambio que se sube a `main` se publica solo como Release (`build-N`) con el
 Los WAV quedan en `Documentos\Claraboya Grab` (se cambia en **AJUSTES**). Conviene que Cubase copie lo que importás a la carpeta del proyecto, así la sesión no depende de esa carpeta.
 
 ## 4. Si algo falla
+- **El preview no carga:** queda anotado qué pasó en `%APPDATA%\Claraboya Grab\preview-log.txt` (pegá esa dirección en el Explorador de Windows). Mandá ese archivo para revisarlo.
 - **El preview no suena en Cubase:** el plugin tiene que estar en un canal que vaya a la salida (no muteado, con el fader arriba). Si dice "No llega sonido", Cubase no está procesando ese canal: probá en otro canal o usá la app suelta.
 - **YouTube dejó de bajar:** AJUSTES › Actualizar yt-dlp. YouTube cambia seguido y yt-dlp se actualiza para seguirle el ritmo.
 - **"Pide iniciar sesión" o restricción de edad:** AJUSTES › Usar sesión de Firefox (usa tu sesión de YouTube en Firefox). Chrome no sirve para esto en Windows porque cifra sus cookies.
@@ -62,7 +63,7 @@ Bajar de estas plataformas va contra sus términos de uso: pensado para escuchar
 - `Source/GrabEngine.cpp`: cola de descargas, historial, yt-dlp, FFmpeg, instalador.
 - `Source/Updater.cpp`: aviso de versión nueva (consulta la última Release `build-N` de GitHub, baja y verifica el instalador).
 - `installer/ClaraboyaGrab.iss`: instalador de Windows (Inno Setup), lo arma GitHub Actions.
-- `Source/Preview.cpp`: preview de 30 s: yt-dlp resuelve el link (cliente sin JavaScript, con respaldo), FFmpeg decodifica directo al reproductor y suena mientras llega; links por adelantado y caché en memoria. Nunca traba el hilo de audio.
+- `Source/Preview.cpp`: preview de 30 s: yt-dlp resuelve el link (cliente sin JavaScript, con respaldo) con sus headers y el `available_at` de YouTube (espera por publicidad), FFmpeg decodifica directo al reproductor y suena mientras llega; links por adelantado, caché en memoria, reintento ante 403 y plan B con `--download-sections`. Anota todo en `preview-log.txt`. Nunca traba el hilo de audio.
 - `Source/PluginEditor.cpp`: interfaz. `Source/StandaloneApp.cpp`: ventana de la app suelta.
 - Pruebas: `cmake -B build -DCLARABOYA_BUILD_TESTS=ON` y correr `ClaraboyaGrabTests` (con `--live` prueba contra Spotify y YouTube Music de verdad; en GitHub corre solo en cada rama que no sea `main`).
 - Logo e íconos: `Resources/brand/` (se regeneran con `tools/make_icons.py` a partir de la claraboya bordó).

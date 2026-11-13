@@ -455,7 +455,15 @@ public:
 
         if (previewHere && ps.state == PS::loading)
         {
-            help = TR ("Cargando 30 s de «") + ps.title + TR ("»…");
+            const auto waitMs = ps.waitUntilMs - juce::Time::currentTimeMillis();
+
+            if (waitMs > 0)
+                help = TR ("YouTube hace esperar ") + juce::String ((waitMs + 999) / 1000)
+                     + TR (" s por la publicidad de «") + ps.title + TR ("»…");
+            else if (ps.slowPath)
+                help = TR ("Cargando 30 s de «") + ps.title + TR ("» por otro camino (tarda un poco más)…");
+            else
+                help = TR ("Cargando 30 s de «") + ps.title + TR ("»…");
         }
         else if (previewHere && ps.state == PS::playing && ps.stalled)
         {
@@ -1627,7 +1635,8 @@ void GrabEditor::timerCallback()
     }
 
     // Preview más rápido: resolver por adelantado la opción bajo el mouse (a los 150 ms)
-    // y la primera de cada búsqueda (cuando los resultados quedan quietos 0,7 s).
+    // y las primeras de cada búsqueda (cuando los resultados quedan quietos 0,7 s). Así la espera
+    // que pide YouTube por la publicidad pasa mientras mirás las opciones.
     if (resultsVisible() && searchResult.state == grab::Searcher::Result::State::done && ! searchResult.items.empty()
         && engine.getToolStatus().installed)
     {
@@ -1641,7 +1650,12 @@ void GrabEditor::timerCallback()
             else if (now - resultsStableSince > 700)
             {
                 prefetchedGeneration = searchResult.generation;
-                prefetchItem (0);
+
+                std::vector<std::pair<juce::String, juce::String>> first;
+                for (size_t i = 0; i < juce::jmin ((size_t) 4, searchResult.items.size()); ++i)
+                    first.push_back ({ searchResult.items[i].videoId, searchResult.items[i].url() });
+
+                processorRef.preview.prefetchMany (first);
             }
         }
     }
